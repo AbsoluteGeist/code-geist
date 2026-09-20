@@ -77,7 +77,15 @@ test('model profiles expose no API keys and support configurable endpoints, mode
   });
 });
 
-test('OpenAI environment configuration requires an explicit model and never guesses one', async () => {
+test('OpenAI environment configuration requires an explicit model and never guesses one', async t => {
+  const originalDirectory = process.cwd();
+  const directory = await mkdtemp(join(tmpdir(), 'codegeist-env-config-'));
+  t.after(async () => {
+    process.chdir(originalDirectory);
+    await rm(directory, { recursive: true, force: true });
+  });
+  // The environment-only fixture must not read a developer's models.config.json.
+  process.chdir(directory);
   await withEnv({ CODEGEIST_MODELS_FILE: '', OPENAI_MODEL: '', OPENAI_API_KEY: 'secret' }, async () => {
     assert.equal(loadModelProfiles().length, 0);
     assert.throws(() => createProvider(), /Configure OPENAI_MODEL/);

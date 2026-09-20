@@ -14,7 +14,7 @@ cp .env.example .env
 npm run dev
 ```
 
-Open [http://127.0.0.1:5173](http://127.0.0.1:5173). The API runs on `127.0.0.1:4317`.
+Open [http://127.0.0.1:5173](http://127.0.0.1:5173) on this machine. From another device on the same LAN, open `http://<this-machine-LAN-IP>:5173`; Vite prints the network address at startup and proxies API requests to port `4317` (or your configured `PORT`). Both services listen on `0.0.0.0` by default. Set `HOST=127.0.0.1` in `.env` to allow access only from this machine.
 
 **Run demo** needs no API keys. It creates a small Git repository, reproduces failing slugify tests, edits the implementation, adds regression tests, and runs the real Node test runner. Its model actions and Jev judgments are explicitly scripted; filesystem changes, Git diffs, and verification are real.
 
@@ -25,7 +25,9 @@ npm run build
 npm start
 ```
 
-Open [http://127.0.0.1:4317](http://127.0.0.1:4317).
+Open [http://127.0.0.1:4317](http://127.0.0.1:4317), or `http://<this-machine-LAN-IP>:4317` from another device. The server prints its available addresses at startup. Use the configured `PORT` if changed.
+
+Any IP address or hostname that resolves to this machine can be used; neither Vite nor the API requires a hostname allowlist. Browser requests still use same-origin checks. Restart after changing the listen address or port. LAN access has no login, so use a trusted network; anyone who can access the workbench can start tasks under your OS account.
 
 ## Connect models
 
@@ -94,7 +96,7 @@ A run can finish successfully only after it has a nonempty diff and passing veri
 
 ## Execution boundaries
 
-This MVP runs **trusted local repositories and commands**, under your OS account. A Git worktree isolates source changes; it is not an OS security sandbox. Setup commands and test code can execute local code. The server binds to loopback, rejects foreign browser origins, and does not support multi-user or public hosting.
+This MVP runs **trusted local repositories and commands**, under your OS account. A Git worktree isolates source changes; it is not an OS security sandbox. Setup commands and test code can execute local code. The server supports access from your trusted LAN through any hostname and rejects foreign browser origins. It has no authentication and does not support multi-user or public hosting.
 
 Model tools are restricted to listing, reading, searching, writing, running the preconfigured verification command, and finishing. File tools reject path traversal, symlinks, and `.git` / `.env` access. Commands use `shell: false`, have time limits, and receive a restricted environment without provider API keys. Compound shell expressions such as `npm ci && npm test` are unsupported: use separate setup and verification fields, or a repository script. API calls can send the task, selected source snippets, tool outputs, and generated code to your configured providers.
 
@@ -112,7 +114,8 @@ Runs and workspaces are retained in `.codegeist/` (ignored by Git). History and 
 | `TYPESAFE_ROUTING_MIN_CONFIDENCE` | Routing threshold; defaults to `0.55` |
 | `MODEL_TIMEOUT_MS`, `TYPESAFE_TIMEOUT_MS` | Provider request deadlines |
 | `CODEGEIST_DATA_DIR` | Run/workspace storage; defaults to `.codegeist` |
-| `PORT` | API/server port; defaults to `4317` (update the Vite proxy if changed) |
+| `HOST` | API and Vite listen address; defaults to `0.0.0.0`. Use `127.0.0.1` for local access only, or `::` for IPv6 |
+| `PORT` | API/server port; defaults to `4317`. Vite's API proxy follows this value automatically; the development UI stays on `5173` |
 
 ## Develop and verify
 

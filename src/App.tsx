@@ -7,6 +7,7 @@ import {
   Square, Sun, Terminal, Workflow, X, Zap,
 } from 'lucide-react';
 import type { AppConfig, CreateRunInput, Run, RunEvent, RunPhase, RunSummary } from '../shared/types';
+import { copyText } from './clipboard';
 
 type Tab = 'activity' | 'changes' | 'verification';
 const phases: { id: RunPhase; label: string }[] = [
@@ -45,7 +46,7 @@ function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
   async function copy() {
-    try { await navigator.clipboard.writeText(value); setCopied(true); setFailed(false); }
+    try { await copyText(value); setCopied(true); setFailed(false); }
     catch { setFailed(true); }
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(() => { setCopied(false); setFailed(false); }, 2000);

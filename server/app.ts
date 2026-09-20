@@ -8,6 +8,7 @@ import { RunStore } from './store.js';
 import { executeRun } from './harness.js';
 import { DEMO_TASK } from './demo.js';
 import { loadModelProfiles, getJevConfiguration } from './model-config.js';
+import { enforceSameOrigin } from './network.js';
 
 const createSchema = z.object({
   mode: z.enum(['demo', 'live']),
@@ -32,31 +33,7 @@ export async function createApp(options: {
   const execute = options.execute ?? executeRun;
   const cwd = options.cwd ?? process.cwd();
 
-  app.use((req, res, next) => {
-    const hostname = req.hostname;
-    if (!['localhost', '127.0.0.1', '[::1]', '::1'].includes(hostname)) {
-      res.status(403).json({ error: 'This workbench accepts localhost requests only.' });
-      return;
-    }
-    const origin = req.get('origin');
-    if (origin) {
-      try {
-        const url = new URL(origin);
-        const ownPort = String(process.env.PORT || '4317');
-        if (!['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
-          || !['5173', ownPort, req.get('host')?.split(':').pop()].includes(url.port)) throw new Error();
-      } catch {
-        res.status(403).json({ error: 'Cross-origin requests are not allowed.' });
-        return;
-      }
-    }
-    if (req.get('sec-fetch-site') === 'cross-site') {
-      res.status(403).json({ error: 'Cross-site requests are not allowed.' });
-      return;
-    }
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    next();
-  });
+  app.use(enforceSameOrigin);
   app.use(express.json({ limit: '64kb' }));
 
   app.get('/api/config', (_req, res) => {
