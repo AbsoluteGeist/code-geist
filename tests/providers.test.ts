@@ -4,8 +4,10 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { createProvider, evaluateContext, evaluateFailure, routeModel, type ChatMessage, type ToolDefinition } from '../server/providers.js';
+import { createProvider, evaluateContext, evaluateFailure, routeModel, type ChatMessage, type ToolDefinition, type ProviderTraceObserver } from '../server/providers.js';
 import { getDefaultModelId, getModelConfiguration, loadModelProfiles } from '../server/model-config.js';
+import { createTraceRecorder, readTraceDetail } from '../server/trace.js';
+import type { Run } from '../shared/types.js';
 
 async function withEnv<T>(values: Record<string, string | undefined>, action: () => Promise<T>): Promise<T> {
   const old = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
@@ -243,4 +245,158 @@ test('cancellation interrupts active generation and Jev requests instead of retu
       assert.match(failure.reason!, /timed out/);
     });
   }));
+});
+
+function traceRun(): Run {
+  const now = new Date().toISOString();
+  return { id: 'provider-trace-test', title: 'Trace provider', task: 'Fix bug', mode: 'live', status: 'running', phase: 'plan',
+    createdAt: now, updatedAt: now, repository: '/unused', testCommand: 'node --test', maxSteps: 8, step: 1,
+    events: [], files: [], diff: '', metrics: { modelCalls: 0, jevCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 } };
+}
+
+function traceObserver(run: Run, directory: string, onStart?: () => void): ProviderTraceObserver {
+  const recorder = createTraceRecorder(run, directory, () => {});
+  return {
+    async start(input) {
+      const id = await recorder.start({ type: input.kind, title: input.title, request: input.request, schema: input.schema, secrets: input.secrets,
+        trace: { kind: input.kind, source: 'live', turn: 1, step: run.events.length + 1, parentId: 'task-input', method: input.method, url: input.url, model: input.model } });
+      onStart?.();
+      return id;
+    },
+    finish: (id, result) => recorder.finish(id, result),
+  };
+}
+
+test('provider tracing stores complete request, response, schema, and usage outside lightweight events', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'codegeist-provider-trace-'));
+  const run = traceRun();
+  let started = false;
+  const source = 'full source context '.repeat(4000);
+  const responseBody = { choices: [{ message: { role: 'assistant', content: 'Done.', reasoning_content: 'Full provider continuation state.', provider_extension: { full: true } } }], usage: { prompt_tokens: 1234, completion_tokens: 56 } };
+  const tool: ToolDefinition = { type: 'function', function: { name: 'read_file', description: 'Read code', parameters: { type: 'object', properties: { path: { type: 'string' } } } } };
+  try {
+    await mockHTTP((_request, response, body) => {
+      assert(started, 'The span must be persisted before the HTTP request starts.');
+      assert.equal(body.messages[1].content, source);
+      response.setHeader('x-request-id', 'local-provider-request');
+      response.setHeader('set-cookie', 'private-cookie=hidden');
+      json(response, responseBody);
+    }, async (baseURL) => profiles(baseURL, async () => {
+      const result = await createProvider('deepseek').next([{ role: 'system', content: 'Use tools.' }, { role: 'user', content: source }], [tool], undefined,
+        traceObserver(run, directory, () => { started = true; }));
+      assert(result.traceId);
+      assert.equal(run.events.length, 1);
+      const detail = await readTraceDetail(directory, run, result.traceId);
+      const request = detail.request as { method: string; url: string; headers: Record<string, string>; body: Record<string, any> };
+      const response = detail.response as { status: number; headers: Record<string, string>; body: unknown };
+      assert.equal(request.method, 'POST');
+      assert.equal(request.url, `${baseURL}/chat/completions`);
+      assert.equal(request.headers.authorization, '[REDACTED]');
+      assert.equal(request.body.messages[1].content, source);
+      assert.deepEqual(request.body.tools, [tool]);
+      assert.deepEqual((detail.schema as { tools: unknown }).tools, [tool]);
+      assert.deepEqual(response.body, responseBody);
+      assert.equal(response.headers['x-request-id'], 'local-provider-request');
+      assert.equal(response.headers['set-cookie'], '[REDACTED]');
+      assert.equal(detail.event.status, 'success');
+      assert.equal(detail.event.trace?.httpStatus, 200);
+      assert.equal(detail.event.trace?.parentId, 'task-input');
+      assert.deepEqual(detail.event.trace?.usage, { inputTokens: 1234, outputTokens: 56 });
+      assert.equal(detail.event.trace?.hasSchema, true);
+      assert(detail.event.trace?.endedAt);
+      assert.equal(typeof detail.event.trace?.durationMs, 'number');
+      assert(!JSON.stringify(run.events).includes(source));
+      assert(!JSON.stringify(run.events).includes('continuation state'));
+      assert(!JSON.stringify(detail).includes('deepseek-secret'));
+    }));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('HTTP errors, invalid JSON, invalid schemas, network failures, timeout, and abort finish their original trace span', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'codegeist-provider-errors-'));
+  const run = traceRun();
+  const observer = traceObserver(run, directory);
+  let mode = 'unauthorized';
+  try {
+    await mockHTTP((request, response) => {
+      if (mode === 'unauthorized') json(response, { message: 'Echo deepseek-secret', extra: JSON.stringify({ api_key: 'otherwise-unknown-key', text: 'deepseek-secret' }) }, 401);
+      else if (mode === 'limited') { response.writeHead(429); response.end('Slow down deepseek-secret'); }
+      else if (mode === 'invalid-json') { response.writeHead(200); response.end('broken JSON: deepseek-secret'); }
+      else if (mode === 'invalid-schema') json(response, { choices: [], provider_diagnostic: 'Schema details retained' });
+      else if (mode === 'network') request.socket.destroy();
+      else if (mode === 'partial-timeout') { response.writeHead(200, { 'content-type': 'application/json' }); response.write('{"partial":"deepseek-secret"'); }
+      // timeout and abort intentionally leave the connection open.
+    }, async (baseURL) => profiles(baseURL, async () => {
+      const provider = createProvider();
+      for (const variant of ['unauthorized', 'limited', 'invalid-json', 'invalid-schema', 'network', 'timeout', 'partial-timeout', 'abort']) {
+        mode = variant;
+        const controller = new AbortController();
+        const timer = variant === 'abort' ? setTimeout(() => controller.abort(), 15) : undefined;
+        await withEnv({ MODEL_TIMEOUT_MS: variant.includes('timeout') ? '30' : '1000' }, async () => {
+          await assert.rejects(provider.next([{ role: 'user', content: 'Fix bug' }], [], controller.signal, observer));
+        });
+        if (timer) clearTimeout(timer);
+        const event = run.events.at(-1)!;
+        assert.equal(event.status, 'error', variant);
+        assert(event.trace?.endedAt, variant);
+        assert.equal(typeof event.trace?.durationMs, 'number', variant);
+        assert(event.trace?.error, variant);
+        const detail = await readTraceDetail(directory, run, event.id);
+        assert(!JSON.stringify(detail).includes('deepseek-secret'), variant);
+        assert(!JSON.stringify(detail).includes('otherwise-unknown-key'), variant);
+        if (variant === 'unauthorized') {
+          assert.equal(event.trace.httpStatus, 401);
+          assert.deepEqual((detail.response as { body: unknown }).body, { message: 'Echo [REDACTED]', extra: JSON.stringify({ api_key: '[REDACTED]', text: '[REDACTED]' }) });
+        } else if (variant === 'limited') {
+          assert.equal(event.trace.httpStatus, 429);
+          assert.equal((detail.response as { body: unknown }).body, 'Slow down [REDACTED]');
+        } else if (variant === 'invalid-json') {
+          assert.equal(event.trace.httpStatus, 200);
+          assert.equal((detail.response as { body: unknown }).body, 'broken JSON: [REDACTED]');
+          assert.equal((detail.response as { truncated?: boolean }).truncated, undefined, 'A complete invalid JSON body is not a truncated stream.');
+        } else if (variant === 'invalid-schema') {
+          assert.equal(event.trace.httpStatus, 200);
+          assert.deepEqual((detail.response as { body: unknown }).body, { choices: [], provider_diagnostic: 'Schema details retained' });
+        } else if (variant === 'partial-timeout') {
+          assert.equal(event.trace.httpStatus, 200);
+          assert.equal(event.trace.hasResponse, true);
+          assert.equal((detail.response as { truncated?: boolean }).truncated, true);
+          assert.equal((detail.response as { body: unknown }).body, '{"partial":"[REDACTED]"');
+          assert.match(event.trace.error, /timed out/);
+        } else {
+          assert.equal(event.trace.httpStatus, undefined);
+          assert.equal(event.trace.hasResponse, false);
+          assert.equal(detail.response, undefined);
+        }
+      }
+      assert.equal(run.events.length, 8, 'Each request must produce one event, updated on completion.');
+    }));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('Jev invalid answers keep full diagnostic bodies and mark the request error before fallback', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'codegeist-jev-errors-'));
+  const run = traceRun();
+  const observer = traceObserver(run, directory);
+  try {
+    await mockHTTP((_request, response) => json(response, { answers: { failure: { type: 'choice', choice: 'invented', confidence: 2 } }, diagnostic: 'Original schema failure' }),
+      async (baseURL) => profiles(baseURL, async () => {
+        const result = await evaluateFailure('Fix bug', 'Assertion failed with full output.', undefined, observer);
+        assert.equal(result.source, 'fallback');
+        assert(result.traceId);
+        const detail = await readTraceDetail(directory, run, result.traceId);
+        assert.equal(detail.event.status, 'error');
+        assert.equal(detail.event.trace?.kind, 'jev');
+        assert.equal(detail.event.trace?.httpStatus, 200);
+        assert.match(detail.event.trace?.error ?? '', /invalid choice/);
+        assert.equal((detail.request as { body: any }).body.state.output, 'Assertion failed with full output.');
+        assert.equal((detail.schema as { questions: any }).questions.failure.type, 'choice');
+        assert.equal((detail.response as { body: any }).body.diagnostic, 'Original schema failure');
+        await withEnv({ TYPESAFE_API_KEY: '' }, async () => {
+          const fallback = await evaluateFailure('Fix bug', 'Error', undefined, observer);
+          assert.equal(fallback.traceId, undefined);
+          assert.equal(run.events.length, 1, 'Missing credentials must not create a fictitious HTTP span.');
+        });
+      }));
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });

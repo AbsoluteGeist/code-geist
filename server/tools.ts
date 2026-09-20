@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { Run, RunEvent } from '../shared/types.js';
 import type { ToolDefinition } from './providers.js';
-import { listWorkspaceFiles, parseCommand, readWorkspaceFile, runCommand, writeWorkspaceFile } from './workspace.js';
+import { CommandCancelledError, listWorkspaceFiles, parseCommand, readWorkspaceFile, runCommand, writeWorkspaceFile } from './workspace.js';
 
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
   { type: 'function', function: { name: 'list_files', description: 'List regular workspace files; dependency/build directories and sensitive paths are omitted.', parameters: { type: 'object', properties: { directory: { type: 'string', description: 'Relative directory; defaults to the workspace root.' } }, additionalProperties: false } } },
@@ -30,6 +30,7 @@ export interface ToolContext {
   emit: (event: Omit<RunEvent, 'id' | 'at'>) => Promise<void>;
   rankContext: (candidates: ContextCandidate[]) => Promise<ContextCandidate[]>;
   classifyFailure: (output: string) => Promise<string>;
+  captureTraceResponse?: (response: unknown) => void;
 }
 
 export async function executeTool(name: string, rawArgs: unknown, context: ToolContext): Promise<{ output: string; finished: boolean }> {
@@ -93,13 +94,21 @@ export async function executeTool(name: string, rawArgs: unknown, context: ToolC
       await context.syncDiff();
       const revision = context.revision;
       const [executable, ...argv] = parseCommand(context.run.testCommand);
-      const result = await runCommand(executable, argv, { cwd: root, signal: context.signal, timeoutMs: 120_000 });
+      let result: Awaited<ReturnType<typeof runCommand>>;
+      try {
+        result = await runCommand(executable, argv, { cwd: root, signal: context.signal, timeoutMs: 120_000 });
+      } catch (error) {
+        if (error instanceof CommandCancelledError) context.captureTraceResponse?.({ command: context.run.testCommand, executable, argv, ...error.result, cancelled: true });
+        throw error;
+      }
+      context.captureTraceResponse?.({ command: context.run.testCommand, executable, argv, ...result });
       await context.syncDiff();
       const passed = result.exitCode === 0 && !result.timedOut;
       context.run.verification = { command: context.run.testCommand, exitCode: result.exitCode, output: result.output, passed, at: new Date().toISOString(), revision };
-      await context.emit({ type: 'verification', title: passed ? 'Tests passed' : 'Tests failed', message: `${context.run.testCommand} · exit ${result.exitCode ?? 'terminated'}`, status: passed ? 'success' : 'error', data: { ...context.run.verification, currentRevision: context.revision } });
+      await context.emit({ type: 'verification', title: passed ? 'Tests passed' : 'Tests failed', message: `${context.run.testCommand} · exit ${result.exitCode ?? 'terminated'}`, status: passed ? 'success' : 'error', data: { command: context.run.testCommand, exitCode: result.exitCode, passed, revision, currentRevision: context.revision, outputPreview: result.output.slice(-1_000) } });
       const routingHint = passed ? undefined : await context.classifyFailure(result.output);
       output = JSON.stringify({ ...context.run.verification, output: result.output.slice(-30_000), outputTruncated: result.output.length > 30_000 || result.truncated, currentRevision: context.revision, routingHint });
+      context.captureTraceResponse?.({ ...context.run.verification, timedOut: result.timedOut, outputTruncated: result.truncated, currentRevision: context.revision, routingHint, returnedToModel: output });
       break;
     }
     case 'finish': {

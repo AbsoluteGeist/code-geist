@@ -17,6 +17,14 @@ export function childEnvironment(): NodeJS.ProcessEnv {
 
 export interface CommandResult { exitCode: number | null; output: string; timedOut: boolean; truncated: boolean }
 
+/** Keeps output produced before cancellation while the command still rejects. */
+export class CommandCancelledError extends Error {
+  constructor(readonly result: CommandResult, reason: unknown) {
+    super(reason instanceof Error ? reason.message : 'Command cancelled', { cause: reason });
+    this.name = 'AbortError';
+  }
+}
+
 export async function runCommand(
   executable: string, args: string[],
   options: { cwd: string; signal?: AbortSignal; timeoutMs?: number; maxOutput?: number },
@@ -52,8 +60,9 @@ export async function runCommand(
     child.once('error', error => { cleanup(); reject(error); });
     child.once('close', exitCode => {
       cleanup();
-      if (options.signal?.aborted) { reject(options.signal.reason ?? new Error('Run cancelled')); return; }
-      resolve({ exitCode, timedOut, truncated, output: output + (truncated ? '\n[Output truncated]' : '') + (timedOut ? '\n[Command timed out]' : '') });
+      const result = { exitCode, timedOut, truncated, output: output + (truncated ? '\n[Output truncated]' : '') + (timedOut ? '\n[Command timed out]' : '') };
+      if (options.signal?.aborted) { reject(new CommandCancelledError(result, options.signal.reason)); return; }
+      resolve(result);
     });
   });
 }

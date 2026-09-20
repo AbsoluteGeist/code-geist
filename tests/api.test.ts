@@ -62,6 +62,20 @@ test('API rejects cross-site requests, validates inputs, and persists completed 
   assert.ok(completed.files.length > 0);
   assert.equal((await (await fetch(`${base}/api/runs/${initial.id}/patch`)).text()), completed.diff);
 
+  const traced = completed.events.find(event => event.trace?.hasRequest);
+  assert.ok(traced, 'New runs must record inspectable trace payloads');
+  const detailResponse = await fetch(`${base}/api/runs/${initial.id}/events/${traced.id}`);
+  assert.equal(detailResponse.status, 200);
+  const detail = await detailResponse.json();
+  assert.equal(detail.event.id, traced.id);
+  assert.ok(detail.request);
+  assert.equal((await fetch(`${base}/api/runs/${initial.id}/events/not-found`)).status, 404);
+  const exportResponse = await fetch(`${base}/api/runs/${initial.id}/trace`);
+  assert.match(exportResponse.headers.get('content-type') ?? '', /application\/x-ndjson/);
+  const records = (await exportResponse.text()).trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(records.length, completed.events.length);
+  assert.equal(records.find(record => record.event.id === traced.id).event.trace.kind, traced.trace!.kind);
+
   const restored = new RunStore(dataDir);
   await restored.initialize();
   assert.equal(restored.runs.get(initial.id)?.status, 'completed');

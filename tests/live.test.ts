@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import { test } from 'node:test';
 import { executeRun } from '../server/harness.js';
 import type { Run } from '../shared/types.js';
+import { readTraceDetail } from '../server/trace.js';
 
 const exec = promisify(execFile);
 const originalCode = 'export function add(a, b) { return a - b; }\n';
@@ -197,7 +198,7 @@ test('live harness routes through Jev and completes real inspect/fail/edit/verif
     assert.equal(run.verification?.exitCode, 0);
     assert.equal(run.verification?.revision, 2);
     assert.match(run.verification.output, /pass 2/);
-    assert.equal(run.events.filter((event) => event.title === 'finish failed').length, 3);
+    assert.equal(run.events.filter((event) => event.type === 'tool' && event.data?.name === 'finish' && event.status === 'error').length, 3);
     assert.deepEqual(run.events.filter((event) => event.type === 'verification').map((event) => event.data?.passed), [false, true, true]);
     assert.equal(run.events.filter((event) => event.type === 'jev' && event.data?.source === 'jev').length, 3);
     assert(!run.events.some((event) => event.data?.source === 'demo'));
@@ -209,6 +210,64 @@ test('live harness routes through Jev and completes real inspect/fail/edit/verif
     assert.equal(persisted.diff, run.diff);
     assert(!persistedText.includes('secret'), 'API credentials must never appear in saved events.');
     assert(!persistedText.includes('local-reasoning-state'), 'Provider reasoning continuation data must stay out of user-facing logs.');
+
+    const traceEvents = persisted.events.filter((event) => event.trace);
+    assert(traceEvents.every((event) => event.trace?.endedAt && event.status !== 'running'), 'Every request must finish its original span.');
+    assert.deepEqual(traceEvents.map((event) => event.trace!.step), traceEvents.map((_, index) => index + 1));
+    const models = traceEvents.filter((event) => event.trace?.kind === 'model');
+    const toolEvents = traceEvents.filter((event) => event.trace?.kind === 'tool');
+    const evaluations = traceEvents.filter((event) => event.trace?.kind === 'jev' && event.trace.source === 'live');
+    assert.equal(models.length, generationCalls);
+    assert.equal(evaluations.length, jevCalls);
+    assert.equal(toolEvents.length, run.metrics.toolCalls);
+    assert.equal(traceEvents.filter((event) => event.trace?.kind === 'input').length, 2);
+    const firstModel = await readTraceDetail(dataDir, persisted, models[0].id);
+    const firstRequest = firstModel.request as { method: string; headers: Record<string, string>; body: Record<string, any> };
+    const firstResponse = firstModel.response as { status: number; body: Record<string, any> };
+    assert.equal(firstRequest.method, 'POST');
+    assert.equal(firstRequest.headers.authorization, '[REDACTED]');
+    assert.equal(firstRequest.body.messages[0].role, 'system');
+    assert.match(firstRequest.body.messages[0].content, /isolated Git worktree/);
+    assert.match(firstRequest.body.messages[1].content, /Fix add so it adds positive and negative numbers/);
+    assert.equal(firstRequest.body.tools.length, 6);
+    assert.equal(firstResponse.status, 200);
+    assert.equal(firstResponse.body.choices[0].message.reasoning_content, 'local-reasoning-state-0');
+    assert.equal(firstResponse.body.choices[0].message.tool_calls.length, 3);
+    assert.equal((firstModel.schema as { tools: unknown[] }).tools.length, 6);
+    assert.equal(firstModel.event.trace?.usage?.inputTokens, 100);
+    const secondModel = await readTraceDetail(dataDir, persisted, models[1].id);
+    const secondRequest = secondModel.request as { body: { messages: Array<Record<string, any>> } };
+    assert.equal(secondRequest.body.messages[2].reasoning_content, 'local-reasoning-state-0');
+    assert(secondRequest.body.messages.some((message) => message.role === 'tool' && message.tool_call_id === 'step_0_call_1' && JSON.parse(message.content).content === originalCode));
+
+    for (const event of toolEvents) {
+      const parent = models.find((model) => model.id === event.trace?.parentId);
+      assert(parent, `Tool ${event.title} must link to its exact model response.`);
+      assert.equal(event.trace?.turn, parent.trace?.turn);
+      const parentDetail = await readTraceDetail(dataDir, persisted, parent.id);
+      const calls = (parentDetail.response as { body: any }).body.choices[0].message.tool_calls as Array<{ id: string }>;
+      assert(calls.some((call) => call.id === event.trace?.toolCallId));
+      const detail = await readTraceDetail(dataDir, persisted, event.id);
+      assert(detail.request !== undefined && detail.response !== undefined && detail.schema !== undefined);
+      assert(!JSON.stringify(detail).includes('secret'));
+    }
+    for (const event of evaluations) {
+      const detail = await readTraceDetail(dataDir, persisted, event.id);
+      const request = detail.request as { body: { state: Record<string, any>; questions: Record<string, any> } };
+      const parent = traceEvents.find((candidate) => candidate.id === event.trace?.parentId);
+      assert(parent, 'Jev request must link to the input or tool that caused it.');
+      assert.equal(event.trace?.httpStatus, 200);
+      assert.equal((detail.response as { status: number }).status, 200);
+      if (request.body.questions.model) assert.equal(parent.trace?.kind, 'input');
+      else if (request.body.questions.failure) {
+        assert.equal(parent.data?.name, 'run_tests');
+        assert.match(request.body.state.output, /ERR_ASSERTION|AssertionError/);
+      } else {
+        assert.equal(parent.data?.name, 'search_files');
+        assert(request.body.state.candidates.some((candidate: { path: string }) => candidate.path === 'src/math.js'));
+      }
+      assert(!JSON.stringify(detail).includes('secret'));
+    }
   } finally {
     for (const [key, value] of Object.entries(previousEnv)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;

@@ -94,6 +94,16 @@ Live tasks run in a new Git worktree on a `feat/agent-…` branch, starting from
 
 A run can finish successfully only after it has a nonempty diff and passing verification for the current revision. Passing tests are evidence for the configured checks, not a guarantee that every aspect of the requested behavior is correct; review the diff and the task's acceptance criteria. Budget exhaustion, failed requests, and cancellation remain visible as incomplete runs.
 
+## Inspect activity traces
+
+New runs record a trace for each model request, Jev evaluation, tool call, and setup command, including system/user inputs, parent call relationships, start/end times, duration, status, and token usage when the provider reports it. The Activity view combines a multi-lane timeline, searchable event list, and a detail inspector with Summary, Request, Response, Schema, and Timing tabs.
+
+Model and Jev details include their actual HTTP request bodies, response bodies, HTTP status and headers. Provider-returned fields remain available in the detail view, including continuation data. Tool details include their arguments, definition, and returned result. Failed responses, malformed JSON, timeouts and cancellations are recorded on the original request. Any provider or tool output limit is explicitly identified instead of silently representing partial output as complete.
+
+Full payloads are saved separately under `.codegeist/traces/<run-id>/`; live updates contain compact event metadata. Select an event to load its full details, or use **Download log** to export the run as NDJSON. API credentials, authorization/cookie headers and sensitive credential fields are redacted before writing. Traces still contain task text and source code, so treat exported logs as project data.
+
+Runs created before detailed tracing remain readable using their saved events. Missing historical requests/responses cannot be reconstructed and are labeled as unavailable. The demo explicitly labels scripted decisions and records its actual tool execution.
+
 ## Execution boundaries
 
 This MVP runs **trusted local repositories and commands**, under your OS account. A Git worktree isolates source changes; it is not an OS security sandbox. Setup commands and test code can execute local code. The server supports access from your trusted LAN through any hostname and rejects foreign browser origins. It has no authentication and does not support multi-user or public hosting.

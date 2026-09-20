@@ -1,7 +1,43 @@
 export type RunMode = 'demo' | 'live';
 export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 export type RunPhase = 'prepare' | 'inspect' | 'plan' | 'edit' | 'verify' | 'complete';
-export type EventType = 'phase' | 'model' | 'tool' | 'jev' | 'verification' | 'error' | 'summary';
+export type EventType = 'phase' | 'model' | 'tool' | 'jev' | 'verification' | 'error' | 'summary' | 'input';
+
+export interface TraceMetadata {
+  kind: 'input' | 'model' | 'jev' | 'tool' | 'setup';
+  source: 'live' | 'demo' | 'fallback' | 'harness';
+  turn: number;
+  step: number;
+  parentId?: string;
+  toolCallId?: string;
+  startedAt: string;
+  endedAt?: string;
+  durationMs?: number;
+  method?: string;
+  url?: string;
+  httpStatus?: number;
+  model?: string;
+  error?: string;
+  usage?: { inputTokens: number; outputTokens: number };
+  hasRequest: boolean;
+  hasResponse: boolean;
+  hasSchema: boolean;
+}
+
+export interface TraceDetail {
+  event: RunEvent;
+  request?: unknown;
+  response?: unknown;
+  schema?: unknown;
+  note?: string;
+}
+
+/** Server-side payload shape; full bodies are stored separately from live run snapshots. */
+export interface TracePayload {
+  request?: unknown;
+  response?: unknown;
+  schema?: unknown;
+}
 
 export interface RunEvent {
   id: string;
@@ -11,6 +47,7 @@ export interface RunEvent {
   message?: string;
   status?: 'running' | 'success' | 'error' | 'info';
   data?: Record<string, unknown>;
+  trace?: TraceMetadata;
 }
 
 export interface ChangedFile {

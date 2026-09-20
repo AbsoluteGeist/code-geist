@@ -560,3 +560,7 @@ pre { margin: 0; tab-size: 2; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition-duration: 0s !important; scroll-behavior: auto !important; }
 }
+
+/* Activity has its own request/response inspector. */
+.run-body.run-body-trace { grid-template-columns: minmax(0, 1fr); }
+.run-body-trace > .run-details { display: none; }

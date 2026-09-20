@@ -22,12 +22,22 @@ export class RunStore {
         const run = JSON.parse(await readFile(path.join(directory, filename), 'utf8')) as Run;
         if (!run.id || !Array.isArray(run.events) || !run.metrics) continue;
         this.runs.set(run.id, run);
+        let recovered = false;
+        for (const event of run.events) {
+          if (event.status !== 'running' || !event.trace) continue;
+          event.status = 'error';
+          event.trace.endedAt = new Date().toISOString();
+          event.trace.durationMs = Math.max(0, Date.now() - Date.parse(event.trace.startedAt));
+          event.trace.error = 'Interrupted by a server restart. No complete response was recorded.';
+          recovered = true;
+        }
         if (run.status === 'running' || run.status === 'queued') {
           run.status = 'failed';
           run.error = 'The server restarted before this run finished. Start a new run to continue.';
           run.events.push({ id: randomUUID(), at: new Date().toISOString(), type: 'error', title: 'Run interrupted', message: run.error, status: 'error' });
-          await this.save(run);
+          recovered = true;
         }
+        if (recovered) await this.save(run);
       } catch {
         console.warn(`Skipped an unreadable run record: ${filename}`);
       }

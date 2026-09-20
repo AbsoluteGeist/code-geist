@@ -9,6 +9,7 @@ import { executeRun } from './harness.js';
 import { DEMO_TASK } from './demo.js';
 import { loadModelProfiles, getJevConfiguration } from './model-config.js';
 import { enforceSameOrigin } from './network.js';
+import { readTraceDetail } from './trace.js';
 
 const createSchema = z.object({
   mode: z.enum(['demo', 'live']),
@@ -134,6 +135,42 @@ export async function createApp(options: {
   });
 
   app.get('/api/runs/:id', (req, res) => res.json(store.runs.get(String(req.params.id))));
+
+  app.get('/api/runs/:id/events/:eventId', async (req, res) => {
+    const run = store.runs.get(String(req.params.id))!;
+    const eventId = String(req.params.eventId);
+    if (!run.events.some(event => event.id === eventId)) {
+      res.status(404).json({ error: 'Trace event not found.' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(await readTraceDetail(options.dataDir, run, eventId));
+  });
+
+  app.get('/api/runs/:id/trace', async (req, res, next) => {
+    const run = structuredClone(store.runs.get(String(req.params.id))!);
+    res.setHeader('Cache-Control', 'no-store');
+    res.attachment(`code-geist-${run.id.slice(0, 8)}-trace.ndjson`).type('application/x-ndjson');
+    try {
+      for (const event of run.events) {
+        if (res.destroyed) return;
+        const detail = await readTraceDetail(options.dataDir, run, event.id);
+        if (res.destroyed) return;
+        if (!res.write(`${JSON.stringify(detail)}\n`)) {
+          await new Promise<void>(resolve => {
+            const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+            res.once('drain', done);
+            res.once('close', done);
+            if (res.destroyed) done();
+          });
+        }
+      }
+      res.end();
+    } catch (error) {
+      if (res.headersSent) res.destroy();
+      else next(error);
+    }
+  });
 
   app.get('/api/runs/:id/events', (req, res) => {
     const id = String(req.params.id);
