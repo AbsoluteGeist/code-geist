@@ -1,0 +1,29 @@
+{
+  "defaultModel": "deepseek",
+  "models": [
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "baseURL": "https://api.deepseek.com",
+      "model": "deepseek-flash",
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "description": "General code implementation, focused bug fixes, and everyday development tasks."
+    },
+    {
+      "id": "zhipu",
+      "name": "Zhipu",
+      "baseURL": "https://open.bigmodel.cn/api/paas/v4",
+      "model": "YOUR_TOOL_CAPABLE_GLM_MODEL",
+      "apiKeyEnv": "ZHIPU_API_KEY",
+      "description": "Code analysis and implementation. Replace this description with capabilities you have evaluated."
+    },
+    {
+      "id": "custom",
+      "name": "Custom reasoning model",
+      "baseURL": "https://YOUR_PROVIDER/v1",
+      "model": "YOUR_TOOL_CAPABLE_MODEL",
+      "apiKeyEnv": "CUSTOM_API_KEY",
+      "description": "Complex debugging and changes that need deeper reasoning across multiple modules."
+    }
+  ]
+}
