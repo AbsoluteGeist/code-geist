@@ -11,6 +11,7 @@ import { copyText } from './clipboard';
 import ActivityTrace from './ActivityTrace';
 import ChatView, { runIsActive } from './ChatView';
 import { applyConversationEvent, mergeConversationRun, reconcileConversationSnapshot } from './conversation-client';
+import './conversation-layout.css';
 
 type Tab = 'chat' | 'activity' | 'changes' | 'verification';
 const compactPath = (value: string) => value.replace(/\/$/, '').split('/').filter(Boolean).at(-1) || value;
@@ -268,32 +269,77 @@ function ConversationWorkspace({ detail, config, connection, initialRunId, onSen
   onSend: (input: SendMessageInput) => Promise<Run>; onResume: (id: string, clientId: string) => Promise<Run>; onCancel: (id: string) => Promise<Run>;
 }) {
   const [tab, setTab] = useState<Tab>('chat');
+  const [inspectionTab, setInspectionTab] = useState<Exclude<Tab, 'chat'>>('activity');
+  const [layout, setLayout] = useState<'tabs' | 'split'>(() => {
+    try { return localStorage.getItem('code-geist-conversation-layout') === 'tabs' ? 'tabs' : 'split'; }
+    catch { return 'split'; }
+  });
+  const [wide, setWide] = useState(() => window.matchMedia('(min-width: 1100px)').matches);
   const [turnId, setTurnId] = useState<string | null>(initialRunId);
   const [eventId, setEventId] = useState<string | undefined>();
   const [stopping, setStopping] = useState(false);
   const [actionError, setActionError] = useState('');
+  const split = layout === 'split' && wide;
+  const activeTab = split ? inspectionTab : tab;
+  const showChat = split || tab === 'chat';
   const active = detail.runs.find(item => item.id === detail.conversation.activeRunId && runIsActive(item)) ?? detail.runs.find(item => item.status === 'running');
   const run = detail.runs.find(item => item.id === turnId) ?? active ?? detail.runs.filter(item => item.status !== 'queued').at(-1) ?? detail.runs.at(-1);
   const currentVerification = run?.verification && run.verification.revision === (run.revision ?? run.verification.revision);
   const tabs = [{ id: 'chat', label: 'Chat', icon: MessageSquare }, { id: 'activity', label: 'Activity', icon: LayoutList }, { id: 'changes', label: 'Changes', icon: GitCompareArrows }, { id: 'verification', label: 'Verification', icon: ShieldCheck }] as const;
-  function inspect(runId: string, nextEventId?: string) { setTurnId(runId); setEventId(nextEventId); setTab('activity'); }
+  const visibleTabs = split ? tabs.filter(item => item.id !== 'chat') : tabs;
+  useEffect(() => {
+    const query = window.matchMedia('(min-width: 1100px)');
+    const update = () => setWide(query.matches);
+    query.addEventListener('change', update);
+    return () => query.removeEventListener('change', update);
+  }, []);
+  useEffect(() => {
+    try { localStorage.setItem('code-geist-conversation-layout', layout); } catch { /* Keep the current layout in memory. */ }
+  }, [layout]);
+  function selectTab(next: Tab) {
+    setTab(next);
+    if (next !== 'chat') setInspectionTab(next);
+  }
+  function inspect(runId: string, nextEventId?: string) { setTurnId(runId); setEventId(nextEventId); selectTab('activity'); }
   async function stop() {
     if (!active) return;
     setStopping(true); setActionError('');
     try { await onCancel(active.id); } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not stop this turn.'); }
     finally { setStopping(false); }
   }
-  return <div className="conversation-workspace">
-    <div className="conversation-heading"><div><h1>{detail.conversation.title}</h1><div className="conversation-context"><FolderGit2 size={13} /><span>{detail.conversation.mode === 'demo' ? 'Demo fixture' : compactPath(detail.conversation.repository)}</span><span className="context-dot">·</span><span>{detail.runs.length} {detail.runs.length === 1 ? 'turn' : 'turns'}</span>{run?.workspace && <CopyButton value={run.workspace} label="Copy workspace path" />}</div></div><div className="conversation-heading-actions">{detail.conversation.mode === 'demo' && <span className="mode-badge demo">DEMO</span>}<span className={`conversation-state ${active ? 'active' : ''}`}><span className={`tiny-dot ${active ? 'green' : detail.conversation.status === 'needs_attention' ? 'amber' : ''}`} />{active ? 'Working' : detail.conversation.status === 'needs_attention' ? 'Needs attention' : 'Ready'}</span>{active && tab !== 'chat' && <button className="secondary-button" onClick={() => void stop()} disabled={stopping}>{stopping ? <LoaderCircle size={12} className="spin" /> : <Square size={11} fill="currentColor" />}Stop</button>}</div></div>
+  return <div className={`conversation-workspace ${split ? 'conversation-workspace-split' : ''}`}>
+    <div className="conversation-heading">
+      <div><h1>{detail.conversation.title}</h1><div className="conversation-context"><FolderGit2 size={13} /><span>{detail.conversation.mode === 'demo' ? 'Demo fixture' : compactPath(detail.conversation.repository)}</span><span className="context-dot">·</span><span>{detail.runs.length} {detail.runs.length === 1 ? 'turn' : 'turns'}</span>{run?.workspace && <CopyButton value={run.workspace} label="Copy workspace path" />}</div></div>
+      <div className="conversation-heading-actions">
+        <div className="conversation-layout-switch" role="group" aria-label="Conversation layout">
+          <button type="button" aria-pressed={!split} onClick={() => setLayout('tabs')} title="Show one conversation view at a time">Tabs</button>
+          <button type="button" aria-pressed={split} disabled={!wide} onClick={() => setLayout('split')} title={wide ? 'Keep Chat beside the inspection tabs' : 'Split layout is available on wider screens'}>Split</button>
+        </div>
+        {detail.conversation.mode === 'demo' && <span className="mode-badge demo">DEMO</span>}
+        <span className={`conversation-state ${active ? 'active' : ''}`}><span className={`tiny-dot ${active ? 'green' : detail.conversation.status === 'needs_attention' ? 'amber' : ''}`} />{active ? 'Working' : detail.conversation.status === 'needs_attention' ? 'Needs attention' : 'Ready'}</span>
+        {active && !showChat && <button className="secondary-button" onClick={() => void stop()} disabled={stopping}>{stopping ? <LoaderCircle size={12} className="spin" /> : <Square size={11} fill="currentColor" />}Stop</button>}
+      </div>
+    </div>
     {connection === 'reconnecting' && <div className="chat-connection-note" role="status"><LoaderCircle size={12} className="spin" />Reconnecting. The agent continues on the server.</div>}
     {actionError && <div className="chat-inline-error" role="alert">{actionError}</div>}
-    <div className="conversation-navigation"><div className="tabs" role="tablist" aria-label="Conversation views">{tabs.map(item => <button key={item.id} id={`tab-${item.id}`} role="tab" aria-selected={tab === item.id} aria-controls={`panel-${item.id}`} tabIndex={tab === item.id ? 0 : -1} className={`tab ${tab === item.id ? 'active' : ''}`} onClick={() => setTab(item.id)} onKeyDown={event => { const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0; if (offset) { event.preventDefault(); const next = tabs[(tabs.findIndex(value => value.id === item.id) + offset + tabs.length) % tabs.length]; setTab(next.id); document.getElementById(`tab-${next.id}`)?.focus(); } }}><item.icon size={14} /><span>{item.label}</span>{item.id === 'changes' && Boolean(run?.files.length) && <span className="tab-count">{run!.files.length}</span>}{item.id === 'verification' && currentVerification && run?.verification?.passed && <span className="tiny-dot green" />}</button>)}</div>{tab !== 'chat' && run && <div className="conversation-turn-select"><label htmlFor="inspection-turn">Inspect</label><select id="inspection-turn" value={run.id} onChange={event => { setTurnId(event.target.value); setEventId(undefined); }}>{detail.runs.map((item, index) => <option key={item.id} value={item.id}>Turn {item.turnIndex ?? index + 1} · {item.status.replaceAll('_', ' ')}</option>)}</select><ChevronDown size={11} /></div>}</div>
-    <section id={`panel-${tab}`} role="tabpanel" aria-labelledby={`tab-${tab}`} className={`conversation-panel panel-${tab}`}>
-      <div hidden={tab !== 'chat'}><ChatView detail={detail} config={config} onSend={onSend} onResume={onResume} onCancel={onCancel} onInspect={inspect} /></div>
-      {tab === 'activity' && run && <ActivityTrace key={run.id} run={run} focusEventId={eventId} />}
-      {tab === 'changes' && run && <><div className="conversation-inspection-heading"><span>Turn {run.turnIndex ?? detail.runs.indexOf(run) + 1} · {run.files.length} {run.files.length === 1 ? 'file' : 'files'} changed</span>{run.diff && <a className="patch-download" href={`/api/runs/${encodeURIComponent(run.id)}/patch`} download><ArrowDownToLine size={14} />Download patch</a>}</div><Changes key={run.id} run={run} /></>}
-      {tab === 'verification' && run && <VerificationPanel run={run} />}
-    </section>
+    <div className={`conversation-panes ${split ? 'is-split' : ''}`}>
+      <div className="conversation-chat-heading" hidden={!split}><MessageSquare size={14} /><span id="conversation-chat-title">Chat</span></div>
+      <div className="conversation-navigation">
+        <div className="tabs" role="tablist" aria-label={split ? 'Inspection views' : 'Conversation views'}>{visibleTabs.map(item => <button key={item.id} id={`tab-${item.id}`} role="tab" aria-selected={activeTab === item.id} aria-controls={`panel-${item.id}`} tabIndex={activeTab === item.id ? 0 : -1} className={`tab ${activeTab === item.id ? 'active' : ''}`} onClick={() => selectTab(item.id)} onKeyDown={event => {
+          const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
+          if (offset) { event.preventDefault(); const next = visibleTabs[(visibleTabs.findIndex(value => value.id === item.id) + offset + visibleTabs.length) % visibleTabs.length]; selectTab(next.id); document.getElementById(`tab-${next.id}`)?.focus(); }
+        }}><item.icon size={14} /><span>{item.label}</span>{item.id === 'changes' && Boolean(run?.files.length) && <span className="tab-count">{run!.files.length}</span>}{item.id === 'verification' && currentVerification && run?.verification?.passed && <span className="tiny-dot green" />}</button>)}</div>
+        {activeTab !== 'chat' && run && <div className="conversation-turn-select"><label htmlFor="inspection-turn">Inspect</label><select id="inspection-turn" value={run.id} onChange={event => { setTurnId(event.target.value); setEventId(undefined); }}>{detail.runs.map((item, index) => <option key={item.id} value={item.id}>Turn {item.turnIndex ?? index + 1} · {item.status.replaceAll('_', ' ')}</option>)}</select><ChevronDown size={11} /></div>}
+      </div>
+      <section id="panel-chat" role={split ? 'region' : 'tabpanel'} aria-labelledby={split ? 'conversation-chat-title' : 'tab-chat'} className="conversation-panel conversation-chat-panel" hidden={!showChat} onFocus={() => { if (split) setTab('chat'); }}>
+        <ChatView detail={detail} config={config} onSend={onSend} onResume={onResume} onCancel={onCancel} onInspect={inspect} />
+      </section>
+      <section id={activeTab === 'chat' ? undefined : `panel-${activeTab}`} role="tabpanel" aria-labelledby={activeTab === 'chat' ? undefined : `tab-${activeTab}`} className={`conversation-panel conversation-inspection-panel panel-${activeTab}`} hidden={activeTab === 'chat'}>
+        {activeTab === 'activity' && run && <ActivityTrace key={run.id} run={run} focusEventId={eventId} />}
+        {activeTab === 'changes' && run && <><div className="conversation-inspection-heading"><span>Turn {run.turnIndex ?? detail.runs.indexOf(run) + 1} · {run.files.length} {run.files.length === 1 ? 'file' : 'files'} changed</span>{run.diff && <a className="patch-download" href={`/api/runs/${encodeURIComponent(run.id)}/patch`} download><ArrowDownToLine size={14} />Download patch</a>}</div><Changes key={run.id} run={run} /></>}
+        {activeTab === 'verification' && run && <VerificationPanel run={run} />}
+      </section>
+    </div>
   </div>;
 }
 

@@ -98,6 +98,8 @@ A run can finish successfully only after it has a nonempty diff and passing veri
 
 **Chat** is the default view. Send another message to make the next change in the same workspace, or choose **Ask** for a read-only discussion. Ask turns can inspect files and answer without changing code or running commands. **Code** turns retain the current-revision verification gate. The scripted demo supports a documentation-only follow-up and a canned explanation; it does not pretend to implement arbitrary prompts.
 
+Use the **Tabs / Split** control in the conversation header to choose a layout. Split keeps Chat and its composer on the left while Activity, Changes, and Verification share the right column. The columns scroll independently, and switching inspection tabs preserves the chat draft. Layout preference is remembered; narrow screens use tabs automatically.
+
 Messages submitted while a turn is running are queued and executed in order after successful completion. A failed, stopped, or budget-exhausted turn pauses its existing queue until you continue it or send a new instruction. Submission IDs prevent HTTP retries from duplicating messages. Different conversations use independent workspaces; each conversation executes one turn at a time.
 
 **Continue +12** adds twelve model rounds to the same interrupted turn, retaining its model history, workspace, tool records and cumulative usage. Every model request receives its remaining budget and current verification state; the last six rounds include explicit closing guidance. A later executed turn prevents resuming an earlier turn over newer changes. Cancelled queued messages never become workspace owners.
