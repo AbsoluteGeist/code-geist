@@ -1,7 +1,32 @@
 export type RunMode = 'demo' | 'live';
-export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'budget_exhausted' | 'interrupted';
 export type RunPhase = 'prepare' | 'inspect' | 'plan' | 'edit' | 'verify' | 'complete';
 export type EventType = 'phase' | 'model' | 'tool' | 'jev' | 'verification' | 'error' | 'summary' | 'input';
+
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  reported?: boolean;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
+}
+
+export interface ChatMessageView {
+  id: string;
+  content: string;
+  createdAt: string;
+  finished: boolean;
+}
+
+export interface RuntimeUpdate {
+  type: 'message.delta' | 'tool.output.delta' | 'usage.updated';
+  callId: string;
+  delta?: string;
+  replace?: boolean;
+  usage?: TokenUsage;
+  firstTokenAt?: string;
+  ttftMs?: number;
+}
 
 export interface TraceMetadata {
   kind: 'input' | 'model' | 'jev' | 'tool' | 'setup';
@@ -18,7 +43,10 @@ export interface TraceMetadata {
   httpStatus?: number;
   model?: string;
   error?: string;
-  usage?: { inputTokens: number; outputTokens: number };
+  usage?: TokenUsage;
+  firstTokenAt?: string;
+  ttftMs?: number;
+  generationMs?: number;
   hasRequest: boolean;
   hasResponse: boolean;
   hasSchema: boolean;
@@ -68,6 +96,14 @@ export interface Verification {
 
 export interface Run {
   id: string;
+  conversationId?: string;
+  turnIndex?: number;
+  clientMessageId?: string;
+  chatMessages?: ChatMessageView[];
+  resumable?: boolean;
+  attempt?: number;
+  resumeRequestIds?: string[];
+  intent?: 'coding' | 'discussion';
   title: string;
   task: string;
   mode: RunMode;
@@ -103,6 +139,7 @@ export interface CreateRunInput {
   testCommand?: string;
   setupCommand?: string;
   maxSteps?: number;
+  intent?: 'coding' | 'discussion';
 }
 
 export interface AppConfig {
@@ -123,6 +160,47 @@ export interface ModelProfile {
   model: string;
   description: string;
   configured: boolean;
+  streaming?: boolean;
+  streamUsage?: boolean;
 }
 
 export type RunSummary = Omit<Run, 'events' | 'diff'>;
+
+export interface Conversation {
+  id: string;
+  title: string;
+  mode: RunMode;
+  repository: string;
+  testCommand: string;
+  setupCommand?: string;
+  modelId?: string;
+  maxSteps: number;
+  createdAt: string;
+  updatedAt: string;
+  runIds: string[];
+  activeRunId?: string;
+  status: 'idle' | 'running' | 'needs_attention';
+}
+
+export interface ConversationDetail {
+  conversation: Conversation;
+  runs: Run[];
+  lastSeq: number;
+}
+
+export interface ConversationEvent {
+  seq: number;
+  at: string;
+  conversationId: string;
+  runId?: string;
+  type: RuntimeUpdate['type'] | 'run.snapshot' | 'conversation.updated';
+  data: { run?: Run; conversation?: Conversation; callId?: string; delta?: string; replace?: boolean; usage?: TokenUsage; firstTokenAt?: string; ttftMs?: number };
+}
+
+export interface SendMessageInput {
+  content: string;
+  clientMessageId: string;
+  modelId?: string;
+  maxSteps?: number;
+  intent?: 'coding' | 'discussion';
+}

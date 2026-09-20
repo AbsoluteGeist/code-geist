@@ -94,10 +94,10 @@ function eventState(event: RunEvent, run: Run): string {
   return 'Recorded';
 }
 
-export default function ActivityTrace({ run }: { run: Run }) {
+export default function ActivityTrace({ run, focusEventId }: { run: Run; focusEventId?: string }) {
   const [query, setQuery] = useState('');
   const [kind, setKind] = useState<TraceKind | 'all'>('all');
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(focusEventId ?? null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [timingMode, setTimingMode] = useState<TimingMode>('duration');
   const [now, setNow] = useState(Date.now());
@@ -146,6 +146,8 @@ export default function ActivityTrace({ run }: { run: Run }) {
       row?.focus({ preventScroll: true });
     });
   }
+
+  useEffect(() => { if (focusEventId) selectFromDiagram(focusEventId); }, [focusEventId]);
 
   function navigateRows(event: React.KeyboardEvent<HTMLButtonElement>, id: string) {
     const index = visibleEvents.findIndex(item => item.id === id);

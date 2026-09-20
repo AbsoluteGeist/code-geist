@@ -9,6 +9,8 @@ export interface ModelProfile {
   model: string;
   description: string;
   configured: boolean;
+  streaming?: boolean;
+  streamUsage?: boolean;
 }
 
 export interface ModelConfiguration extends ModelProfile {
@@ -22,6 +24,8 @@ const profileSchema = z.object({
   model: z.string().trim().min(1).max(160),
   apiKeyEnv: z.string().regex(/^[A-Z_][A-Z0-9_]*$/),
   description: z.string().trim().max(1000).default('General coding tasks'),
+  streaming: z.boolean().default(true),
+  streamUsage: z.boolean().default(false),
 });
 
 const fileSchema = z.object({
@@ -69,6 +73,8 @@ function readConfiguration(): { defaultModel?: string; models: ModelConfiguratio
           model: profile.model,
           description: profile.description,
           configured: Boolean(apiKey),
+          streaming: profile.streaming,
+          streamUsage: profile.streamUsage,
           apiKey,
         };
       }),
@@ -87,6 +93,8 @@ function readConfiguration(): { defaultModel?: string; models: ModelConfiguratio
       model,
       description: 'Default OpenAI-compatible model for coding tasks',
       configured: Boolean(apiKey),
+      streaming: process.env.OPENAI_STREAMING?.trim().toLowerCase() !== 'false',
+      streamUsage: process.env.OPENAI_STREAM_USAGE?.trim().toLowerCase() === 'true',
       apiKey,
     }],
   };

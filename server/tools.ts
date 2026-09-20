@@ -31,11 +31,13 @@ export interface ToolContext {
   rankContext: (candidates: ContextCandidate[]) => Promise<ContextCandidate[]>;
   classifyFailure: (output: string) => Promise<string>;
   captureTraceResponse?: (response: unknown) => void;
+  onOutput?: (delta: string) => Promise<void> | void;
 }
 
 export async function executeTool(name: string, rawArgs: unknown, context: ToolContext): Promise<{ output: string; finished: boolean }> {
   context.signal.throwIfAborted();
   if (!Object.hasOwn(schemas, name)) throw new Error(`Unknown tool: ${name}`);
+  if (context.run.intent === 'discussion' && !['list_files', 'read_file', 'search_files', 'finish'].includes(name)) throw new Error('Discussion turns allow read-only tools only. Switch to Code to modify files or execute commands.');
   const args = schemas[name as keyof typeof schemas].parse(rawArgs);
   const root = context.run.workspace;
   if (!root) throw new Error('Workspace is not ready.');
@@ -96,7 +98,7 @@ export async function executeTool(name: string, rawArgs: unknown, context: ToolC
       const [executable, ...argv] = parseCommand(context.run.testCommand);
       let result: Awaited<ReturnType<typeof runCommand>>;
       try {
-        result = await runCommand(executable, argv, { cwd: root, signal: context.signal, timeoutMs: 120_000 });
+        result = await runCommand(executable, argv, { cwd: root, signal: context.signal, timeoutMs: 120_000, onOutput: context.onOutput });
       } catch (error) {
         if (error instanceof CommandCancelledError) context.captureTraceResponse?.({ command: context.run.testCommand, executable, argv, ...error.result, cancelled: true });
         throw error;
@@ -114,6 +116,10 @@ export async function executeTool(name: string, rawArgs: unknown, context: ToolC
     case 'finish': {
       const input = args as z.infer<typeof schemas.finish>;
       await context.syncDiff();
+      if (context.run.intent === 'discussion') {
+        context.run.summary = input.summary;
+        return { output: input.summary, finished: true };
+      }
       if (!context.run.files.some(file => file.additions > 0 || file.deletions > 0)) throw new Error('Cannot finish: no meaningful file changes exist.');
       if (!context.run.verification?.passed) throw new Error('Cannot finish: run the configured tests and resolve failures first.');
       if (context.run.verification.revision !== context.revision) throw new Error('Cannot finish: files changed after the last verification; run tests again.');

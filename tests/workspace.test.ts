@@ -125,3 +125,14 @@ test('cancelling a command terminates the spawned process group', async () => {
     await assert.rejects(access(marker));
   } finally { await rm(temp, { recursive: true, force: true }); }
 });
+
+test('command output is delivered while the subprocess is still running', async () => {
+  const chunks: string[] = [];
+  const result = await runCommand(process.execPath, ['-e', "process.stdout.write('first output\\n'); setTimeout(() => process.stdout.write('last output\\n'), 350);"], {
+    cwd: os.tmpdir(), onOutput(delta) { chunks.push(delta); },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.ok(chunks.length >= 2, 'The first output must be flushed before the delayed final output');
+  assert.equal(chunks[0], 'first output\n');
+  assert.equal(chunks.join(''), result.output);
+});

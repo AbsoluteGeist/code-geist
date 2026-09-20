@@ -1,22 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ArrowDownToLine, ArrowRight, ArrowUpRight, Braces, Check, CheckCheck,
-  ChevronDown, ChevronRight, Circle, CircleCheck, CircleDashed, CircleDot,
-  CircleX, Code2, Copy, FileCode2, FolderGit2, GitBranch, GitCompareArrows,
+  ChevronDown, ChevronRight, CircleCheck, CircleDashed,
+  CircleX, Code2, Copy, FileCode2, FolderGit2, GitCompareArrows,
   LayoutList, LoaderCircle, Menu, Moon, Play, Plus, Settings2, ShieldCheck,
-  Square, Sun, Terminal, Workflow, X, Zap,
+  Square, Sun, Terminal, Workflow, X, MessageSquare, CircleAlert,
 } from 'lucide-react';
-import type { AppConfig, CreateRunInput, Run, RunPhase, RunSummary } from '../shared/types';
+import type { AppConfig, Conversation, ConversationDetail, ConversationEvent, CreateRunInput, Run, SendMessageInput } from '../shared/types';
 import { copyText } from './clipboard';
 import ActivityTrace from './ActivityTrace';
+import ChatView, { runIsActive } from './ChatView';
+import { applyConversationEvent, mergeConversationRun, reconcileConversationSnapshot } from './conversation-client';
 
-type Tab = 'activity' | 'changes' | 'verification';
-const phases: { id: RunPhase; label: string }[] = [
-  { id: 'prepare', label: 'Prepare' }, { id: 'inspect', label: 'Inspect' },
-  { id: 'plan', label: 'Plan' }, { id: 'edit', label: 'Edit' },
-  { id: 'verify', label: 'Verify' }, { id: 'complete', label: 'Complete' },
-];
-const isActive = (run: Pick<Run, 'status'>) => run.status === 'queued' || run.status === 'running';
+type Tab = 'chat' | 'activity' | 'changes' | 'verification';
 const compactPath = (value: string) => value.replace(/\/$/, '').split('/').filter(Boolean).at(-1) || value;
 const time = (value: string) => new Date(value).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 
@@ -34,13 +30,6 @@ function Logo() {
   return <span className="brand-mark" aria-hidden="true"><svg viewBox="0 0 28 28" fill="none"><path d="m11 6-8 8 8 8M17 6l8 8-8 8M16 3l-4 22" stroke="currentColor" strokeWidth="2.3" strokeLinecap="square" /></svg></span>;
 }
 
-function StatusIcon({ status, className = '' }: { status: Run['status']; className?: string }) {
-  if (status === 'running' || status === 'queued') return <LoaderCircle size={15} className={`spin ${className}`} />;
-  if (status === 'completed') return <CircleCheck size={15} className={className} />;
-  if (status === 'failed') return <CircleX size={15} className={className} />;
-  return <Square size={13} className={className} />;
-}
-
 function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }) {
   const [copied, setCopied] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -56,128 +45,183 @@ function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }
 }
 
 export default function App() {
+  const initialUrl = new URLSearchParams(location.search);
   const [config, setConfig] = useState<AppConfig | null>(null);
-  const [history, setHistory] = useState<RunSummary[]>([]);
-  const [run, setRun] = useState<Run | null>(null);
-  const [selectedId, setSelectedId] = useState(() => new URLSearchParams(location.search).get('run'));
+  const [history, setHistory] = useState<Conversation[]>([]);
+  const [detail, setDetail] = useState<ConversationDetail | null>(null);
+  const detailRef = useRef<ConversationDetail | null>(null);
+  const [selectedId, setSelectedId] = useState(() => initialUrl.get('conversation') || initialUrl.get('run'));
+  const selectionRef = useRef(selectedId);
+  const [initialRunId, setInitialRunId] = useState<string | null>(() => initialUrl.get('run'));
   const [error, setError] = useState('');
   const [bootError, setBootError] = useState('');
   const [loading, setLoading] = useState(true);
-  const [runLoading, setRunLoading] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [cancelling, setCancelling] = useState(false);
   const [connection, setConnection] = useState<'connected' | 'connecting' | 'reconnecting'>('connecting');
   const [settings, setSettings] = useState(false);
   const [sidebar, setSidebar] = useState(false);
-  const [tab, setTab] = useState<Tab>('activity');
   const [theme, setTheme] = useState(() => document.documentElement.dataset.theme || 'light');
+  selectionRef.current = selectedId;
 
-  const mergeRun = useCallback((next: Run) => {
-    setRun(next);
-    setHistory(previous => [next, ...previous.filter(item => item.id !== next.id)].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  const commitDetail = useCallback((next: ConversationDetail) => {
+    const previous = detailRef.current;
+    if (previous?.conversation.id === next.conversation.id && previous.lastSeq > next.lastSeq) return;
+    detailRef.current = next; setDetail(next);
+    setHistory(items => {
+      const existing = items.find(item => item.id === next.conversation.id);
+      if (existing?.updatedAt === next.conversation.updatedAt && existing.status === next.conversation.status && existing.runIds.length === next.conversation.runIds.length) return items;
+      return [next.conversation, ...items.filter(item => item.id !== next.conversation.id)].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    });
   }, []);
+  const mergeRun = useCallback((run: Run) => {
+    const current = detailRef.current;
+    if (current && (!run.conversationId || run.conversationId === current.conversation.id)) commitDetail(mergeConversationRun(current, run));
+  }, [commitDetail]);
 
   const boot = useCallback(async () => {
     setLoading(true); setBootError('');
     try {
-      const [nextConfig, runs] = await Promise.all([request<AppConfig>('/api/config'), request<RunSummary[]>('/api/runs')]);
-      setConfig(nextConfig); setHistory(runs.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
-    } catch (e) { setBootError(e instanceof Error ? e.message : 'Cannot connect to the local runtime.'); }
+      const [nextConfig, conversations] = await Promise.all([request<AppConfig>('/api/config'), request<Conversation[]>('/api/conversations')]);
+      setConfig(nextConfig); setHistory(conversations.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+    } catch (reason) { setBootError(reason instanceof Error ? reason.message : 'Cannot connect to the local runtime.'); }
     finally { setLoading(false); }
   }, []);
   useEffect(() => { void boot(); }, [boot]);
 
   useEffect(() => {
-    if (!selectedId) { setRun(null); setRunLoading(false); return; }
+    if (!selectedId) { detailRef.current = null; setDetail(null); setDetailLoading(false); return; }
     let disposed = false;
-    setRunLoading(true); setError(''); setConnection('connecting');
-    void request<Run>(`/api/runs/${encodeURIComponent(selectedId)}`).then(next => {
-      if (!disposed) { mergeRun(next); setRunLoading(false); }
-    }).catch(e => { if (!disposed) { setError(e.message); setRunLoading(false); } });
-    const events = new EventSource(`/api/runs/${encodeURIComponent(selectedId)}/events`);
-    events.addEventListener('open', () => { if (!disposed) setConnection('connected'); });
-    events.addEventListener('snapshot', event => {
-      try {
-        const next = JSON.parse((event as MessageEvent<string>).data) as Run;
-        if (!disposed) { mergeRun(next); setRunLoading(false); setConnection('connected'); }
-      } catch { if (!disposed) setError('Received an unreadable update. Reload to reconnect to this task.'); }
-    });
-    events.addEventListener('error', () => { if (!disposed) setConnection('reconnecting'); });
-    return () => { disposed = true; events.close(); };
-  }, [selectedId, mergeRun]);
+    let stream: EventSource | undefined;
+    let refreshing = false;
+    let buffered: ConversationEvent[] = [];
+    const controller = new AbortController();
+    setDetailLoading(true); setError(''); setConnection('connecting');
+    async function connect() {
+      let id = selectedId!;
+      const params = new URLSearchParams(location.search);
+      if (params.has('run') && !params.has('conversation')) {
+        const legacy = await request<Run>(`/api/runs/${encodeURIComponent(id)}`, { signal: controller.signal });
+        if (disposed) return;
+        id = legacy.conversationId || legacy.id;
+        setInitialRunId(legacy.id);
+        const url = new URL(location.href); url.searchParams.delete('run'); url.searchParams.set('conversation', id);
+        window.history.replaceState({}, '', url);
+        if (id !== selectedId) { selectionRef.current = id; setSelectedId(id); return; }
+      }
+      const currentId = id;
+      async function refreshSnapshot() {
+        if (refreshing) return;
+        refreshing = true;
+        try {
+          const next = await request<ConversationDetail>(`/api/conversations/${encodeURIComponent(currentId)}`, { signal: controller.signal });
+          if (!disposed && selectionRef.current === currentId) {
+            const reconciled = reconcileConversationSnapshot(detailRef.current, next, buffered);
+            buffered = reconciled.pending; commitDetail(reconciled.detail); setDetailLoading(false);
+            if (!buffered.length) setConnection('connected');
+          }
+        } catch (reason) {
+          if (!disposed) { setError(reason instanceof Error ? reason.message : 'Could not load the conversation.'); setDetailLoading(false); }
+        } finally { refreshing = false; }
+      }
+      void refreshSnapshot();
+      stream = new EventSource(`/api/conversations/${encodeURIComponent(currentId)}/events`);
+      stream.addEventListener('open', () => { if (!disposed) setConnection('connected'); });
+      stream.addEventListener('snapshot', event => {
+        if (disposed || selectionRef.current !== currentId) return;
+        try {
+          const snapshot = JSON.parse((event as MessageEvent<string>).data) as ConversationDetail;
+          const reconciled = reconcileConversationSnapshot(detailRef.current, snapshot, buffered);
+          buffered = reconciled.pending; commitDetail(reconciled.detail); setDetailLoading(false);
+          setConnection(buffered.length ? 'reconnecting' : 'connected');
+        }
+        catch { setError('Could not read a conversation update. Reload to reconnect.'); }
+      });
+      stream.addEventListener('update', event => {
+        if (disposed || selectionRef.current !== currentId) return;
+        try {
+          const update = JSON.parse((event as MessageEvent<string>).data) as ConversationEvent;
+          const current = detailRef.current;
+          if (!current || current.conversation.id !== currentId || buffered.length || update.seq > current.lastSeq + 1) {
+            buffered.push(update); setConnection('reconnecting'); void refreshSnapshot(); return;
+          }
+          commitDetail(applyConversationEvent(current, update));
+        } catch { setError('Could not read a streamed update. Reload to reconnect.'); }
+      });
+      stream.addEventListener('error', () => { if (!disposed) setConnection('reconnecting'); });
+    }
+    void connect().catch(reason => { if (!disposed) { setError(reason instanceof Error ? reason.message : 'Could not open the conversation.'); setDetailLoading(false); } });
+    return () => { disposed = true; controller.abort(); stream?.close(); };
+  }, [selectedId, commitDetail]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    try { localStorage.setItem('code-geist-theme', theme); } catch { /* In-memory preference still works. */ }
+    try { localStorage.setItem('code-geist-theme', theme); } catch { /* Keep the in-memory preference. */ }
   }, [theme]);
   useEffect(() => {
-    const onPop = () => { setSelectedId(new URLSearchParams(location.search).get('run')); setTab('activity'); setSettings(false); };
-    window.addEventListener('popstate', onPop);
-    return () => window.removeEventListener('popstate', onPop);
+    const onPop = () => {
+      const params = new URLSearchParams(location.search);
+      const id = params.get('conversation') || params.get('run');
+      selectionRef.current = id; detailRef.current = null; setDetail(null); setDetailLoading(Boolean(id)); setSelectedId(id); setInitialRunId(params.get('run')); setSettings(false);
+    };
+    window.addEventListener('popstate', onPop); return () => window.removeEventListener('popstate', onPop);
   }, []);
   useEffect(() => {
     if (!sidebar) return;
     const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') setSidebar(false); };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey);
   }, [sidebar]);
 
-  function selectRun(id: string | null) {
-    if (selectedId !== id) setRun(null);
-    setSelectedId(id); setTab('activity'); setSettings(false); setSidebar(false); setError('');
-    const url = new URL(location.href);
-    if (id) url.searchParams.set('run', id); else url.searchParams.delete('run');
+  function selectConversation(id: string | null) {
+    if (selectedId !== id) { detailRef.current = null; setDetail(null); setDetailLoading(Boolean(id)); }
+    selectionRef.current = id; setSelectedId(id); setInitialRunId(null); setSettings(false); setSidebar(false); setError('');
+    const url = new URL(location.href); url.searchParams.delete('run');
+    if (id) url.searchParams.set('conversation', id); else url.searchParams.delete('conversation');
     window.history.pushState({}, '', url);
   }
   async function create(input: CreateRunInput) {
     setSubmitting(true); setError('');
-    try { const next = await request<Run>('/api/runs', { method: 'POST', body: JSON.stringify(input) }); selectRun(next.id); mergeRun(next); }
-    catch (e) { setError(e instanceof Error ? e.message : 'Could not start the task.'); }
+    try {
+      const next = await request<ConversationDetail>('/api/conversations', { method: 'POST', body: JSON.stringify(input) });
+      selectConversation(next.conversation.id); commitDetail(next);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not start the conversation.'); }
     finally { setSubmitting(false); }
   }
-  async function cancel() {
-    if (!run) return;
-    setCancelling(true); setError('');
-    try { mergeRun(await request<Run>(`/api/runs/${encodeURIComponent(run.id)}/cancel`, { method: 'POST' })); }
-    catch (e) { setError(e instanceof Error ? e.message : 'Could not cancel the task.'); }
-    finally { setCancelling(false); }
+  async function send(input: SendMessageInput) {
+    const id = detailRef.current?.conversation.id;
+    if (!id) throw new Error('Open a conversation before sending a message.');
+    const next = await request<Run>(`/api/conversations/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify(input) });
+    mergeRun(next); return next;
+  }
+  async function resume(id: string, clientRequestId: string) {
+    const next = await request<Run>(`/api/runs/${encodeURIComponent(id)}/resume`, { method: 'POST', body: JSON.stringify({ additionalSteps: 12, clientRequestId }) });
+    mergeRun(next); return next;
+  }
+  async function cancel(id: string) {
+    const next = await request<Run>(`/api/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+    mergeRun(next); return next;
   }
 
   return <div className="app-shell">
     <a className="skip-link" href="#main-content">Skip to workspace</a>
-    {sidebar && <button className="sidebar-scrim" onClick={() => setSidebar(false)} aria-label="Close task navigation" />}
-    <aside className={`sidebar ${sidebar ? 'is-open' : ''}`} aria-label="Task navigation">
-      <button className="brand" onClick={() => selectRun(null)} aria-label="Code Geist home"><Logo /><span>code geist<span className="brand-period">.</span></span></button>
-      <button className="new-task-button" onClick={() => selectRun(null)}><Plus size={17} /><span>New task</span><span className="small-label">+</span></button>
+    {sidebar && <button className="sidebar-scrim" onClick={() => setSidebar(false)} aria-label="Close conversation navigation" />}
+    <aside className={`sidebar ${sidebar ? 'is-open' : ''}`} aria-label="Conversation navigation">
+      <button className="brand" onClick={() => selectConversation(null)} aria-label="Code Geist home"><Logo /><span>code geist<span className="brand-period">.</span></span></button>
+      <button className="new-task-button" onClick={() => selectConversation(null)}><Plus size={17} /><span>New conversation</span><span className="small-label">+</span></button>
       <div className="sidebar-heading"><span>Workspace</span><span className="local-badge">LOCAL</span></div>
-      <button className={`nav-item ${!selectedId && !settings ? 'selected' : ''}`} onClick={() => selectRun(null)}><LayoutList size={16} /><span>Task workbench</span></button>
-      <div className="sidebar-heading tasks-heading"><span>Recent tasks</span><span className="history-count">{history.length}</span></div>
-      <div className="history-list">
-        {history.length === 0 && <div className="history-empty"><span className="empty-line" /><span className="empty-line short" /><p>Your tasks will appear here.</p></div>}
-        {history.map(item => <button key={item.id} className={`history-item ${selectedId === item.id ? 'selected' : ''}`} onClick={() => selectRun(item.id)} title={item.task}>
-          <span className={`history-status status-${item.status}`}><StatusIcon status={item.status} /></span>
-          <span className="history-text"><span className="history-title">{item.title || item.task}</span><span className="history-meta">{item.mode === 'demo' ? 'Demo' : compactPath(item.repository)}<span>·</span>{new Date(item.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span></span>
-        </button>)}
-      </div>
-      <div className="sidebar-bottom">
-        <button className={`nav-item ${settings ? 'selected' : ''}`} onClick={() => { setSettings(!settings); setSidebar(false); }}><Settings2 size={16} /><span>Providers & models</span>{config && <span className={`tiny-dot ${config.modelConfigured ? 'green' : 'amber'}`} />}</button>
-        <div className="runtime"><span className={`tiny-dot ${bootError ? 'red' : loading ? 'amber' : 'green'}`} /><span>{bootError ? 'Runtime unavailable' : loading ? 'Connecting to runtime' : 'Local runtime connected'}</span><span className="version">v0.1</span></div>
-      </div>
+      <button className={`nav-item ${!selectedId && !settings ? 'selected' : ''}`} onClick={() => selectConversation(null)}><LayoutList size={16} /><span>Task workbench</span></button>
+      <div className="sidebar-heading tasks-heading"><span>Conversations</span><span className="history-count">{history.length}</span></div>
+      <div className="history-list">{history.length === 0 && <div className="history-empty"><span className="empty-line" /><span className="empty-line short" /><p>Your conversations will appear here.</p></div>}{history.map(item => <button key={item.id} className={`history-item ${selectedId === item.id ? 'selected' : ''}`} onClick={() => selectConversation(item.id)} title={item.title}><span className={`history-status status-${item.status}`}>{item.status === 'running' ? <LoaderCircle size={15} className="spin" /> : item.status === 'needs_attention' ? <CircleAlert size={15} /> : <MessageSquare size={14} />}</span><span className="history-text"><span className="history-title">{item.title}</span><span className="history-meta">{item.mode === 'demo' ? 'Demo' : compactPath(item.repository)}<span>·</span>{item.runIds.length} {item.runIds.length === 1 ? 'turn' : 'turns'}</span></span></button>)}</div>
+      <div className="sidebar-bottom"><button className={`nav-item ${settings ? 'selected' : ''}`} onClick={() => { setSettings(!settings); setSidebar(false); }}><Settings2 size={16} /><span>Providers & models</span>{config && <span className={`tiny-dot ${config.modelConfigured ? 'green' : 'amber'}`} />}</button><div className="runtime"><span className={`tiny-dot ${bootError ? 'red' : loading ? 'amber' : 'green'}`} /><span>{bootError ? 'Runtime unavailable' : loading ? 'Connecting to runtime' : 'Local runtime connected'}</span><span className="version">v0.1</span></div></div>
     </aside>
-
-    <div className="workspace-shell">
-      <header className="topbar">
-        <button className="icon-button menu-toggle" onClick={() => setSidebar(!sidebar)} aria-label="Open task navigation" aria-expanded={sidebar}><Menu size={19} /></button>
-        <div className="breadcrumbs"><span className="breadcrumb-home">Workspace</span><ChevronRight size={13} /><span>{settings ? 'Providers & models' : selectedId ? 'Task details' : 'New task'}</span></div>
-        <div className="topbar-actions"><span className="local-indicator"><FolderGit2 size={14} />Local execution</span><span className="topbar-divider" /><button className="icon-button theme-toggle" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button></div>
-      </header>
-
-      <main id="main-content" className={`main-content ${!selectedId && !settings ? 'new-task-view' : ''}`}>
+    <div className={`workspace-shell ${selectedId && !settings ? 'has-conversation' : ''}`}>
+      <header className="topbar"><button className="icon-button menu-toggle" onClick={() => setSidebar(!sidebar)} aria-label="Open conversation navigation" aria-expanded={sidebar}><Menu size={19} /></button><div className="breadcrumbs"><span className="breadcrumb-home">Workspace</span><ChevronRight size={13} /><span>{settings ? 'Providers & models' : selectedId ? 'Conversation' : 'New conversation'}</span></div><div className="topbar-actions"><span className="local-indicator"><FolderGit2 size={14} />Local execution</span><span className="topbar-divider" /><button className="icon-button theme-toggle" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button></div></header>
+      <main id="main-content" className={`main-content ${!selectedId && !settings ? 'new-task-view' : selectedId && !settings ? 'conversation-view' : ''}`}>
         {(error || bootError) && <div className="error-banner" role="alert"><CircleX size={17} /><span>{error || bootError}</span>{bootError ? <button className="text-button" onClick={() => void boot()}>Retry</button> : <button className="icon-button" onClick={() => setError('')} aria-label="Dismiss error"><X size={15} /></button>}</div>}
         {loading && !config ? <div className="loading-state"><LoaderCircle className="spin" size={23} /><p>Connecting to your workspace…</p></div>
           : settings && config ? <ProviderSettings config={config} onRefresh={() => void boot()} onBack={() => setSettings(false)} />
-          : selectedId ? (runLoading && !run ? <div className="loading-state"><LoaderCircle className="spin" size={23} /><p>Loading task…</p></div> : run ? <RunWorkspace run={run} tab={tab} setTab={setTab} connection={connection} onCancel={() => void cancel()} cancelling={cancelling} onNew={() => selectRun(null)} /> : <div className="loading-state"><CircleX size={25} /><p>This task could not be loaded.</p><button className="secondary-button" onClick={() => selectRun(null)}>Back to workbench</button></div>)
-          : config ? <NewTask config={config} submitting={submitting} onSubmit={input => void create(input)} onSettings={() => setSettings(true)} /> : !bootError ? null : <div className="loading-state"><Terminal size={30} /><p>Start the local server to open your workbench.</p><code>npm run dev</code></div>}
+          : selectedId ? (detailLoading && !detail ? <div className="loading-state"><LoaderCircle className="spin" size={23} /><p>Loading conversation…</p></div> : detail && config ? <ConversationWorkspace key={detail.conversation.id} detail={detail} config={config} connection={connection} initialRunId={initialRunId} onSend={send} onResume={resume} onCancel={cancel} /> : <div className="loading-state"><CircleX size={25} /><p>This conversation could not be loaded.</p><button className="secondary-button" onClick={() => selectConversation(null)}>Back to workbench</button></div>)
+          : config ? <NewTask config={config} submitting={submitting} onSubmit={input => void create(input)} onSettings={() => setSettings(true)} /> : null}
       </main>
       <footer className="workspace-footer"><span><Logo />Intent. Code. Evidence.</span><span>Jev + generative models<span className="footer-separator">/</span>Code Geist</span></footer>
     </div>
@@ -186,6 +230,7 @@ export default function App() {
 
 function NewTask({ config, submitting, onSubmit, onSettings }: { config: AppConfig; submitting: boolean; onSubmit: (input: CreateRunInput) => void; onSettings: () => void }) {
   const [task, setTask] = useState('');
+  const [intent, setIntent] = useState<'coding' | 'discussion'>('coding');
   const [repository, setRepository] = useState(config.defaultRepository);
   const [testCommand, setTestCommand] = useState('npm test');
   const [setupCommand, setSetupCommand] = useState('');
@@ -197,19 +242,19 @@ function NewTask({ config, submitting, onSubmit, onSettings }: { config: AppConf
   const canSubmit = Boolean(configured && task.trim() && repository.trim() && testCommand.trim());
   function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (canSubmit && !submitting) onSubmit({ mode: 'live', modelId, task: task.trim(), repository: repository.trim(), testCommand: testCommand.trim(), setupCommand: setupCommand.trim() || undefined, maxSteps });
+    if (canSubmit && !submitting) onSubmit({ mode: 'live', modelId, task: task.trim(), repository: repository.trim(), testCommand: testCommand.trim(), setupCommand: setupCommand.trim() || undefined, maxSteps, intent });
   }
   return <div className="new-task-content">
     <div className="page-eyebrow"><span className="eyebrow-line" />THE CODING WORKBENCH</div>
     <div className="intro"><h1>A clear path from<br />task to tested code<span className="accent-period">.</span></h1><p>Give your agent a task. Follow its decisions.<br className="desktop-break" />Review the patch and the proof.</p></div>
 
     <form onSubmit={submit} className="task-form">
-      <div className="composer"><label htmlFor="task" className="composer-label"><Code2 size={17} />What would you like to build?</label><textarea id="task" placeholder="Describe a feature, fix a bug, or refactor something…" value={task} onChange={event => setTask(event.target.value)} rows={4} required maxLength={12000} disabled={submitting} /><div className="composer-hint"><span>Include expected behavior and any constraints.</span><span className="composer-corner"><Braces size={15} /></span></div></div>
+      <div className="composer"><div className="new-task-composer-heading"><label htmlFor="task" className="composer-label">{intent === 'coding' ? <Code2 size={17} /> : <MessageSquare size={16} />}{intent === 'coding' ? 'What would you like to build?' : 'What would you like to understand?'}</label><div className="chat-intent" role="group" aria-label="New conversation intent"><button type="button" disabled={submitting} className={intent === 'coding' ? 'active' : ''} aria-pressed={intent === 'coding'} onClick={() => setIntent('coding')} title="Make and verify code changes"><Code2 size={13} />Code</button><button type="button" disabled={submitting} className={intent === 'discussion' ? 'active' : ''} aria-pressed={intent === 'discussion'} onClick={() => setIntent('discussion')} title="Discuss the repository without editing files"><MessageSquare size={12} />Ask</button></div></div><textarea id="task" placeholder={intent === 'coding' ? 'Describe a feature, fix a bug, or refactor something…' : 'Ask about the repository, explain a flow, or discuss a change…'} value={task} onChange={event => setTask(event.target.value)} rows={4} required maxLength={12000} disabled={submitting} /><div className="composer-hint"><span>{intent === 'coding' ? 'Include expected behavior and any constraints.' : 'Ask reads the repository without editing files.'}</span><span className="composer-corner"><Braces size={15} /></span></div></div>
       <div className="task-configuration">
         <div className="form-field repository-field"><label htmlFor="repository"><FolderGit2 size={14} />Repository</label><input id="repository" value={repository} onChange={event => setRepository(event.target.value)} placeholder="/absolute/path/to/repository" required disabled={submitting} spellCheck={false} /><span className="field-hint">An absolute path to a local Git repository.</span></div>
-        <div className="form-field command-field"><label htmlFor="test-command"><Terminal size={14} />Verification command</label><input id="test-command" value={testCommand} onChange={event => setTestCommand(event.target.value)} placeholder="npm test" required disabled={submitting} spellCheck={false} /><span className="field-hint">Executed inside the agent’s workspace.</span></div>
+        <div className="form-field command-field"><label htmlFor="test-command"><Terminal size={14} />Verification command</label><input id="test-command" value={testCommand} onChange={event => setTestCommand(event.target.value)} placeholder="npm test" required disabled={submitting} spellCheck={false} /><span className="field-hint">{intent === 'coding' ? 'Executed inside the agent’s workspace.' : 'Saved for future Code turns.'}</span></div>
       </div>
-      <div className="composer-toolbar"><div className="model-selector"><Workflow size={15} /><label className="sr-only" htmlFor="model">Model</label><select id="model" value={modelId} onChange={event => setModelId(event.target.value)} disabled={submitting}><option value="auto">Auto · Jev routing</option>{config.models.map(model => <option value={model.id} key={model.id}>{model.name}{model.configured ? '' : ' · not configured'}</option>)}</select><ChevronDown size={13} className="select-chevron" /></div><button type="button" className={`advanced-toggle ${advanced ? 'active' : ''}`} onClick={() => setAdvanced(!advanced)} aria-label="Options" aria-expanded={advanced}><Settings2 size={14} /><span>Options</span></button><button type="submit" className="primary-button run-button" disabled={!canSubmit || submitting}>{submitting ? <LoaderCircle size={16} className="spin" /> : <Play size={14} fill="currentColor" />}<span>{submitting ? 'Starting…' : 'Run task'}</span><ArrowRight size={16} /></button></div>
+      <div className="composer-toolbar"><div className="model-selector"><Workflow size={15} /><label className="sr-only" htmlFor="model">Model</label><select id="model" value={modelId} onChange={event => setModelId(event.target.value)} disabled={submitting}><option value="auto">Auto · Jev routing</option>{config.models.map(model => <option value={model.id} key={model.id}>{model.name}{model.configured ? '' : ' · not configured'}</option>)}</select><ChevronDown size={13} className="select-chevron" /></div><button type="button" className={`advanced-toggle ${advanced ? 'active' : ''}`} onClick={() => setAdvanced(!advanced)} aria-label="Options" aria-expanded={advanced}><Settings2 size={14} /><span>Options</span></button><button type="submit" className="primary-button run-button" disabled={!canSubmit || submitting}>{submitting ? <LoaderCircle size={16} className="spin" /> : <Play size={14} fill="currentColor" />}<span>{submitting ? 'Starting…' : intent === 'discussion' ? 'Ask question' : 'Run task'}</span><ArrowRight size={16} /></button></div>
       {advanced && <div className="advanced-options"><div className="form-field"><label htmlFor="setup-command">Setup command (optional)</label><input id="setup-command" value={setupCommand} onChange={event => setSetupCommand(event.target.value)} placeholder="npm ci" disabled={submitting} spellCheck={false} /><span className="field-hint">Runs once in the fresh worktree before the agent starts.</span></div><div className="form-field"><label htmlFor="max-steps">Maximum agent steps</label><input type="number" id="max-steps" min={6} max={60} value={maxSteps} onChange={event => setMaxSteps(Number(event.target.value))} required /><span className="field-hint">Stop the loop if the task needs more iterations.</span></div><p>{config.jevConfigured ? `Jev (${config.jevModel}) routes the task to an available model.` : 'Jev is not configured. Auto uses an available model and labels the routing fallback.'}</p><p>Starts from committed HEAD; uncommitted source changes are not included.</p></div>}
     </form>
     {!configured && <div className="configuration-notice"><span className="tiny-dot amber" /><span>{config.modelConfigured ? 'Configure this model to start a live task.' : 'Connect a model to run tasks on your repository.'}</span><button className="text-button" onClick={onSettings}>Configure providers<ArrowUpRight size={13} /></button></div>}
@@ -218,41 +263,37 @@ function NewTask({ config, submitting, onSubmit, onSettings }: { config: AppConf
   </div>;
 }
 
-function RunWorkspace({ run, tab, setTab, connection, onCancel, cancelling, onNew }: { run: Run; tab: Tab; setTab: (tab: Tab) => void; connection: string; onCancel: () => void; cancelling: boolean; onNew: () => void }) {
-  const active = isActive(run);
-  const additions = run.files.reduce((sum, file) => sum + file.additions, 0);
-  const deletions = run.files.reduce((sum, file) => sum + file.deletions, 0);
-  const phaseIndex = phases.findIndex(phase => phase.id === run.phase);
-  const currentVerification = run.verification && run.verification.revision === (run.revision ?? run.verification.revision);
-  const phaseEvidence: Record<RunPhase, boolean> = {
-    prepare: Boolean(run.workspace),
-    inspect: run.events.some(event => event.type === 'tool' && event.status === 'success' && ['list_files', 'read_file', 'search_files'].includes(String(event.data?.name))),
-    plan: run.events.some(event => event.type === 'model' && (event.status === 'success' || event.data?.source === 'demo')),
-    edit: run.files.length > 0,
-    verify: Boolean(currentVerification && run.verification?.passed),
-    complete: run.status === 'completed',
-  };
-  return <div className="run-workspace">
-    <div className="run-heading"><div><div className="run-eyebrow"><span className={`mode-badge ${run.mode}`}>{run.mode === 'demo' ? 'SCRIPTED DEMO' : 'LIVE TASK'}</span><span className="run-date">{new Date(run.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}<span> / </span>{time(run.createdAt)}</span></div><h1>{run.title || run.task}</h1></div><div className="run-actions">{active ? <button className="secondary-button cancel-button" disabled={cancelling} onClick={onCancel}>{cancelling ? <LoaderCircle size={14} className="spin" /> : <Square size={12} fill="currentColor" />}{cancelling ? 'Stopping…' : 'Stop task'}</button> : <button className="secondary-button" onClick={onNew}><Plus size={15} />New task</button>}</div></div>
-    <div className="run-overview"><span className={`status-badge status-${run.status}`}><StatusIcon status={run.status} />{run.status === 'completed' ? 'Completed' : run.status === 'running' ? 'In progress' : run.status === 'queued' ? 'Queued' : run.status === 'cancelled' ? 'Stopped' : 'Failed'}</span><span className="overview-item"><FolderGit2 size={14} />{run.mode === 'demo' ? 'Demo fixture' : compactPath(run.repository)}</span><span className="overview-item"><Workflow size={14} />{run.modelName || (run.mode === 'demo' ? 'Scripted agent' : 'Routing model…')}</span><span className="run-step">Step {run.step}<span> / {run.maxSteps}</span></span></div>
-    {run.mode === 'demo' && <div className="demo-run-note"><Zap size={14} /><span>This demo uses scripted model decisions. File changes and verification are executed locally.</span></div>}
-    <ol className="phase-rail" aria-label="Task progress">{phases.map((phase, index) => {
-      const current = index === phaseIndex;
-      const done = phaseEvidence[phase.id] && !(current && active);
-      return <li key={phase.id} className={`${done ? 'done' : ''} ${current ? 'current' : ''} ${current && run.status === 'failed' ? 'phase-failed' : ''}`} aria-current={current ? 'step' : undefined}><span className="phase-topline" /><span className="phase-label">{done ? <Check size={14} /> : current && active ? <LoaderCircle className="spin" size={14} /> : current && run.status === 'failed' ? <CircleX size={14} /> : <span className="phase-number">{String(index + 1).padStart(2, '0')}</span>}{phase.label}</span></li>;
-    })}</ol>
-    {active && connection === 'reconnecting' && <div className="connection-note" role="status"><LoaderCircle className="spin" size={14} />Reconnecting to the event stream. The agent may still be running.</div>}
-    {run.error && <div className="run-error" role="alert"><CircleX size={18} /><div><strong>The task needs attention</strong><p>{run.error}</p></div></div>}
-    {run.summary && <div className={`completion-summary ${run.status === 'completed' ? 'successful' : ''}`}><span className="summary-icon">{run.status === 'completed' ? <CheckCheck size={20} /> : <LayoutList size={19} />}</span><div><h2>{run.status === 'completed' ? 'Ready for your review' : 'Task summary'}</h2><p>{run.summary}</p></div></div>}
-
-    <div className={`run-body ${tab === 'activity' ? 'run-body-trace' : ''}`}><div className="run-primary"><div className="inspector-header"><div className="tabs" role="tablist" aria-label="Task inspection">{([{ id: 'activity', label: 'Activity', icon: LayoutList }, { id: 'changes', label: 'Changes', icon: GitCompareArrows }, { id: 'verification', label: 'Verification', icon: ShieldCheck }] as const).map(item => <button key={item.id} id={`tab-${item.id}`} type="button" role="tab" aria-selected={tab === item.id} aria-controls={`panel-${item.id}`} tabIndex={tab === item.id ? 0 : -1} className={`tab ${tab === item.id ? 'active' : ''}`} onClick={() => setTab(item.id)} onKeyDown={event => { const ids: Tab[] = ['activity', 'changes', 'verification']; const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0; if (offset) { event.preventDefault(); const next = ids[(ids.indexOf(tab) + offset + ids.length) % ids.length]; setTab(next); document.getElementById(`tab-${next}`)?.focus(); } }}><item.icon size={15} /><span>{item.label}</span>{item.id === 'changes' && run.files.length > 0 && <span className="tab-count">{run.files.length}</span>}{item.id === 'verification' && currentVerification && run.verification?.passed && <span className="tiny-dot green" />}</button>)}</div><span className={`stream-status ${active ? 'live' : ''}`}>{active ? <><span className="tiny-dot green pulse" />Live</> : <><Check size={12} />Saved</>}</span></div>
-      <section id={`panel-${tab}`} role="tabpanel" aria-labelledby={`tab-${tab}`} className={`tab-content tab-${tab}`}>
-        {tab === 'activity' && <ActivityTrace key={run.id} run={run} />}
-        {tab === 'changes' && <Changes run={run} />}
-        {tab === 'verification' && <VerificationPanel run={run} />}
-      </section>
-    </div><aside className="run-details" aria-label="Run details" hidden={tab === 'activity'}><div className="details-section"><h2>THE TASK</h2><p className="task-description">{run.task}</p></div><div className="details-section"><h2>WORKSPACE</h2><div className="detail-label"><FolderGit2 size={14} /><span>Isolated worktree</span>{run.workspace && <CopyButton value={run.workspace} label="Copy workspace path" />}</div>{run.workspace ? <code className="workspace-path">{run.workspace}</code> : <p className="muted">Preparing workspace…</p>}{run.branch && <div className="branch-detail"><GitBranch size={13} /><code>{run.branch}</code><CopyButton value={run.branch} label="Copy branch name" /></div>}</div><div className="details-section"><h2>EXECUTION</h2><dl className="execution-stats"><div><dt>Model calls</dt><dd>{run.metrics.modelCalls}</dd></div><div><dt>Jev calls</dt><dd>{run.metrics.jevCalls}</dd></div><div><dt>Tool calls</dt><dd>{run.metrics.toolCalls}</dd></div>{run.metrics.inputTokens + run.metrics.outputTokens > 0 && <div><dt>Reported tokens</dt><dd>{(run.metrics.inputTokens + run.metrics.outputTokens).toLocaleString()}</dd></div>}</dl>{run.mode === 'demo' && <p className="detail-footnote">Model decisions are scripted in demo mode.</p>}</div><div className="details-section change-summary"><h2>CHANGES</h2><div><span>{run.files.length} {run.files.length === 1 ? 'file' : 'files'} changed</span><span className="diff-stats"><span className="additions">+{additions}</span><span className="deletions">−{deletions}</span></span></div>{run.diff && <a className="patch-download" href={`/api/runs/${encodeURIComponent(run.id)}/patch`} download><ArrowDownToLine size={14} />Download patch<ArrowUpRight size={13} /></a>}</div></aside></div>
-    <span className="sr-only" role="status" aria-live="polite">Task {run.status}. Current phase: {run.phase}.{run.verification ? ` Verification ${!currentVerification ? 'needs re-run' : run.verification.passed ? 'passed' : 'failed'}.` : ''}</span>
+function ConversationWorkspace({ detail, config, connection, initialRunId, onSend, onResume, onCancel }: {
+  detail: ConversationDetail; config: AppConfig; connection: string; initialRunId: string | null;
+  onSend: (input: SendMessageInput) => Promise<Run>; onResume: (id: string, clientId: string) => Promise<Run>; onCancel: (id: string) => Promise<Run>;
+}) {
+  const [tab, setTab] = useState<Tab>('chat');
+  const [turnId, setTurnId] = useState<string | null>(initialRunId);
+  const [eventId, setEventId] = useState<string | undefined>();
+  const [stopping, setStopping] = useState(false);
+  const [actionError, setActionError] = useState('');
+  const active = detail.runs.find(item => item.id === detail.conversation.activeRunId && runIsActive(item)) ?? detail.runs.find(item => item.status === 'running');
+  const run = detail.runs.find(item => item.id === turnId) ?? active ?? detail.runs.filter(item => item.status !== 'queued').at(-1) ?? detail.runs.at(-1);
+  const currentVerification = run?.verification && run.verification.revision === (run.revision ?? run.verification.revision);
+  const tabs = [{ id: 'chat', label: 'Chat', icon: MessageSquare }, { id: 'activity', label: 'Activity', icon: LayoutList }, { id: 'changes', label: 'Changes', icon: GitCompareArrows }, { id: 'verification', label: 'Verification', icon: ShieldCheck }] as const;
+  function inspect(runId: string, nextEventId?: string) { setTurnId(runId); setEventId(nextEventId); setTab('activity'); }
+  async function stop() {
+    if (!active) return;
+    setStopping(true); setActionError('');
+    try { await onCancel(active.id); } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not stop this turn.'); }
+    finally { setStopping(false); }
+  }
+  return <div className="conversation-workspace">
+    <div className="conversation-heading"><div><h1>{detail.conversation.title}</h1><div className="conversation-context"><FolderGit2 size={13} /><span>{detail.conversation.mode === 'demo' ? 'Demo fixture' : compactPath(detail.conversation.repository)}</span><span className="context-dot">·</span><span>{detail.runs.length} {detail.runs.length === 1 ? 'turn' : 'turns'}</span>{run?.workspace && <CopyButton value={run.workspace} label="Copy workspace path" />}</div></div><div className="conversation-heading-actions">{detail.conversation.mode === 'demo' && <span className="mode-badge demo">DEMO</span>}<span className={`conversation-state ${active ? 'active' : ''}`}><span className={`tiny-dot ${active ? 'green' : detail.conversation.status === 'needs_attention' ? 'amber' : ''}`} />{active ? 'Working' : detail.conversation.status === 'needs_attention' ? 'Needs attention' : 'Ready'}</span>{active && tab !== 'chat' && <button className="secondary-button" onClick={() => void stop()} disabled={stopping}>{stopping ? <LoaderCircle size={12} className="spin" /> : <Square size={11} fill="currentColor" />}Stop</button>}</div></div>
+    {connection === 'reconnecting' && <div className="chat-connection-note" role="status"><LoaderCircle size={12} className="spin" />Reconnecting. The agent continues on the server.</div>}
+    {actionError && <div className="chat-inline-error" role="alert">{actionError}</div>}
+    <div className="conversation-navigation"><div className="tabs" role="tablist" aria-label="Conversation views">{tabs.map(item => <button key={item.id} id={`tab-${item.id}`} role="tab" aria-selected={tab === item.id} aria-controls={`panel-${item.id}`} tabIndex={tab === item.id ? 0 : -1} className={`tab ${tab === item.id ? 'active' : ''}`} onClick={() => setTab(item.id)} onKeyDown={event => { const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0; if (offset) { event.preventDefault(); const next = tabs[(tabs.findIndex(value => value.id === item.id) + offset + tabs.length) % tabs.length]; setTab(next.id); document.getElementById(`tab-${next.id}`)?.focus(); } }}><item.icon size={14} /><span>{item.label}</span>{item.id === 'changes' && Boolean(run?.files.length) && <span className="tab-count">{run!.files.length}</span>}{item.id === 'verification' && currentVerification && run?.verification?.passed && <span className="tiny-dot green" />}</button>)}</div>{tab !== 'chat' && run && <div className="conversation-turn-select"><label htmlFor="inspection-turn">Inspect</label><select id="inspection-turn" value={run.id} onChange={event => { setTurnId(event.target.value); setEventId(undefined); }}>{detail.runs.map((item, index) => <option key={item.id} value={item.id}>Turn {item.turnIndex ?? index + 1} · {item.status.replaceAll('_', ' ')}</option>)}</select><ChevronDown size={11} /></div>}</div>
+    <section id={`panel-${tab}`} role="tabpanel" aria-labelledby={`tab-${tab}`} className={`conversation-panel panel-${tab}`}>
+      <div hidden={tab !== 'chat'}><ChatView detail={detail} config={config} onSend={onSend} onResume={onResume} onCancel={onCancel} onInspect={inspect} /></div>
+      {tab === 'activity' && run && <ActivityTrace key={run.id} run={run} focusEventId={eventId} />}
+      {tab === 'changes' && run && <><div className="conversation-inspection-heading"><span>Turn {run.turnIndex ?? detail.runs.indexOf(run) + 1} · {run.files.length} {run.files.length === 1 ? 'file' : 'files'} changed</span>{run.diff && <a className="patch-download" href={`/api/runs/${encodeURIComponent(run.id)}/patch`} download><ArrowDownToLine size={14} />Download patch</a>}</div><Changes key={run.id} run={run} /></>}
+      {tab === 'verification' && run && <VerificationPanel run={run} />}
+    </section>
   </div>;
 }
 

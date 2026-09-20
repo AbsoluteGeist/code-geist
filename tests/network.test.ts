@@ -9,7 +9,7 @@ import { createApp } from '../server/app.js';
 import { createServer as createViteServer } from 'vite';
 import viteConfig from '../vite.config.js';
 
-test('API and project Vite config accept arbitrary hosts while preserving origin checks and LAN access', async t => {
+test('API and project Vite config accept arbitrary hosts while preserving origin checks and LAN access', { timeout: 15_000 }, async t => {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'geist-lan-'));
   let executions = 0;
   const instance = await createApp({ dataDir, execute: async (run, options) => {
@@ -22,7 +22,7 @@ test('API and project Vite config accept arbitrary hosts while preserving origin
   await new Promise<void>(resolve => server.once('listening', resolve));
   const port = (server.address() as AddressInfo).port;
   t.after(async () => {
-    instance.close();
+    await instance.close();
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
     await rm(dataDir, { recursive: true, force: true });
@@ -42,6 +42,7 @@ test('API and project Vite config accept arbitrary hosts while preserving origin
       res.on('end', () => resolve({ status: res.statusCode!, body: text }));
     });
     req.on('error', reject);
+    req.setTimeout(5000, () => req.destroy(new Error('Network test request timed out.')));
     req.end(body);
   });
 
@@ -87,7 +88,11 @@ test('API and project Vite config accept arbitrary hosts while preserving origin
   const apiProxy = serverConfig.proxy?.['/api'];
   assert.ok(apiProxy && typeof apiProxy !== 'string');
   assert.equal(apiProxy.changeOrigin, false);
-  const vite = await createViteServer({ ...projectConfig, configFile: false, logLevel: 'silent', server: { ...serverConfig, port: 0, strictPort: false, ws: false } });
+  const vite = await createViteServer({
+    ...projectConfig, configFile: false, logLevel: 'silent',
+    optimizeDeps: { noDiscovery: true, include: [] },
+    server: { ...serverConfig, port: 0, strictPort: false, ws: false, watch: null, preTransformRequests: false },
+  });
   try {
     await vite.listen();
     const proxyPort = (vite.httpServer!.address() as AddressInfo).port;
@@ -101,6 +106,9 @@ test('API and project Vite config accept arbitrary hosts while preserving origin
     const rejected = await send({ Host: customHost, Origin: 'http://different-origin.example' }, '/api/runs', '{"mode":"demo"}', proxyPort);
     assert.equal(rejected.status, 403);
   } finally {
+    // Test clients/proxy use keep-alive; close disposable connections before Vite drains.
+    if (vite.httpServer && 'closeAllConnections' in vite.httpServer) vite.httpServer.closeAllConnections();
+    server.closeIdleConnections();
     await vite.close();
   }
 

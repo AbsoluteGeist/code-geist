@@ -10,6 +10,7 @@ import { DEMO_TASK } from './demo.js';
 import { loadModelProfiles, getJevConfiguration } from './model-config.js';
 import { enforceSameOrigin } from './network.js';
 import { readTraceDetail } from './trace.js';
+import { ConversationService, ConversationError } from './conversations.js';
 
 const createSchema = z.object({
   mode: z.enum(['demo', 'live']),
@@ -19,6 +20,7 @@ const createSchema = z.object({
   testCommand: z.string().trim().max(1000).optional(),
   setupCommand: z.string().trim().max(1000).optional(),
   maxSteps: z.number().int().min(6).max(60).optional(),
+  intent: z.enum(['coding', 'discussion']).optional(),
 }).strict();
 
 export async function createApp(options: {
@@ -30,8 +32,9 @@ export async function createApp(options: {
   app.disable('x-powered-by');
   const store = new RunStore(options.dataDir);
   await store.initialize();
-  const controllers = new Map<string, AbortController>();
-  const execute = options.execute ?? executeRun;
+  const conversations = new ConversationService(store, options.dataDir, options.execute ?? executeRun);
+  await conversations.initialize();
+  const controllers = conversations.controllers;
   const cwd = options.cwd ?? process.cwd();
 
   app.use(enforceSameOrigin);
@@ -62,6 +65,66 @@ export async function createApp(options: {
 
   app.get('/api/runs', (_req, res) => res.json(store.list()));
 
+  const validateLiveInput = (input: z.infer<typeof createSchema>) => {
+    if (input.mode !== 'live') return;
+    if (!input.task || !input.repository || !input.testCommand || !path.isAbsolute(input.repository)) {
+      throw new ConversationError('A task, absolute repository path, and verification command are required.', 400);
+    }
+    const available = loadModelProfiles().filter(model => model.configured);
+    if (!available.length || (input.modelId && input.modelId !== 'auto' && !available.some(model => model.id === input.modelId))) {
+      throw new ConversationError('Configure the selected model and API key before starting a live conversation.', 400);
+    }
+  };
+  app.get('/api/conversations', (_req, res) => res.json(conversations.list()));
+  app.post('/api/conversations', async (req, res) => {
+    const input = createSchema.parse(req.body);
+    validateLiveInput(input);
+    res.status(201).json(await conversations.create(input));
+  });
+  app.get('/api/conversations/:conversationId', async (req, res) => {
+    res.json(await conversations.detail(String(req.params.conversationId)));
+  });
+  app.post('/api/conversations/:conversationId/messages', async (req, res) => {
+    const input = z.object({ content: z.string().trim().min(1).max(12_000), clientMessageId: z.string().min(8).max(120),
+      modelId: z.string().max(120).optional(), maxSteps: z.number().int().min(6).max(60).optional(),
+      intent: z.enum(['coding', 'discussion']).optional() }).strict().parse(req.body);
+    const conversation = conversations.get(String(req.params.conversationId));
+    validateLiveInput({ ...conversation, task: input.content, modelId: input.modelId ?? conversation.modelId });
+    res.status(201).json(await conversations.send(conversation.id, input));
+  });
+  app.get('/api/conversations/:conversationId/events', async (req, res) => {
+    const id = String(req.params.conversationId);
+    conversations.get(id);
+    res.status(200).set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+    res.flushHeaders();
+    let cursor = 0;
+    let initialized = false;
+    const pending: import('../shared/types.js').ConversationEvent[] = [];
+    const send = (event: import('../shared/types.js').ConversationEvent) => {
+      if (!initialized) { pending.push(event); return; }
+      if (event.seq <= cursor || res.destroyed) return;
+      cursor = event.seq;
+      res.write(`id: ${event.seq}\nevent: update\ndata: ${JSON.stringify(event)}\n\n`);
+    };
+    conversations.events.on(id, send);
+    req.on('close', () => conversations.events.off(id, send));
+    const snapshot = await conversations.detail(id);
+    const previous = Number(req.get('Last-Event-ID') ?? req.query.after ?? 0);
+    if (Number.isSafeInteger(previous) && previous > 0 && previous <= snapshot.lastSeq) {
+      cursor = previous;
+      initialized = true;
+      for (const event of conversations.replay(id, previous)) send(event);
+    } else {
+      cursor = snapshot.lastSeq;
+      if (!res.destroyed) res.write(`id: ${cursor}\nevent: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`);
+      initialized = true;
+    }
+    for (const event of pending) send(event);
+    const heartbeat = setInterval(() => { if (!res.destroyed) res.write(': keepalive\n\n'); }, 15_000);
+    req.on('close', () => clearInterval(heartbeat));
+    if (res.destroyed) clearInterval(heartbeat);
+  });
+
   app.post('/api/runs', async (req, res) => {
     const parsed = createSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -69,7 +132,7 @@ export async function createApp(options: {
       return;
     }
     const input = parsed.data;
-    if (controllers.size) {
+    if ([...controllers.keys()].some(id => ['queued', 'running'].includes(store.runs.get(id)?.status ?? ''))) {
       res.status(409).json({ error: 'A task is already running. Stop it or wait for it to finish.' });
       return;
     }
@@ -92,38 +155,8 @@ export async function createApp(options: {
         return;
       }
     }
-    const now = new Date().toISOString();
-    const task = input.mode === 'demo' ? DEMO_TASK : input.task!;
-    const firstLine = task.split('\n')[0];
-    const title = input.mode === 'demo' ? 'Fix Unicode and separator handling in slugify'
-      : firstLine.length > 100 ? `${firstLine.slice(0, 97).trimEnd()}…` : firstLine;
-    const run: Run = {
-      id: randomUUID(), title, task,
-      mode: input.mode, modelId: input.modelId ?? 'auto',
-      status: 'queued', phase: 'prepare', createdAt: now, updatedAt: now,
-      repository: input.mode === 'demo' ? 'Built-in demo repository' : input.repository!,
-      testCommand: input.mode === 'demo' ? 'node --test' : input.testCommand!,
-      setupCommand: input.mode === 'live' ? input.setupCommand || undefined : undefined,
-      maxSteps: input.maxSteps ?? 24, step: 0, events: [], files: [], diff: '',
-      metrics: { modelCalls: 0, jevCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 },
-    };
-    const controller = new AbortController();
-    controllers.set(run.id, controller);
-    try {
-      await store.save(run);
-    } catch (error) {
-      controllers.delete(run.id);
-      throw error;
-    }
-    res.status(201).json(run);
-    void execute(run, { dataDir: options.dataDir, signal: controller.signal, onUpdate: () => store.save(run) })
-      .catch(async (error: unknown) => {
-        run.status = controller.signal.aborted ? 'cancelled' : 'failed';
-        run.error = error instanceof Error ? error.message : 'Run failed unexpectedly.';
-        run.events.push({ id: randomUUID(), at: new Date().toISOString(), type: 'error', title: 'Run stopped', message: run.error, status: 'error' });
-        await store.save(run);
-      }).finally(() => controllers.delete(run.id))
-      .catch(() => console.error('Could not persist the final run state. Check the data directory.'));
+    const detail = await conversations.create(input);
+    res.status(201).json(detail.runs[0]);
   });
 
   app.param('id', (req, res, next, id: string) => {
@@ -187,16 +220,12 @@ export async function createApp(options: {
   });
 
   app.post('/api/runs/:id/cancel', async (req, res) => {
-    const id = String(req.params.id);
-    const run = store.runs.get(id)!;
-    const controller = controllers.get(id);
-    if (controller && !controller.signal.aborted && (run.status === 'queued' || run.status === 'running')) {
-      controller.abort();
-      run.status = 'cancelled';
-      run.events.push({ id: randomUUID(), at: new Date().toISOString(), type: 'phase', title: 'Cancellation requested', message: 'Stopping the current operation. Workspace and execution records are retained.', status: 'info' });
-      await store.save(run);
-    }
-    res.json(run);
+    res.json(await conversations.cancel(String(req.params.id)));
+  });
+
+  app.post('/api/runs/:id/resume', async (req, res) => {
+    const input = z.object({ additionalSteps: z.number().int().min(1).max(60), clientRequestId: z.string().min(8).max(120) }).strict().parse(req.body);
+    res.json(await conversations.resume(String(req.params.id), input.additionalSteps, input.clientRequestId));
   });
 
   app.get('/api/runs/:id/patch', (req, res) => {
@@ -213,9 +242,13 @@ export async function createApp(options: {
     app.get('/', (_req, res) => res.type('text').send('Code Geist API is running. Use npm run dev for the workbench, or npm run build before npm start.'));
   }
   app.use((error: Error & { status?: number }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (res.headersSent) { res.destroy(); return; }
+    if (error instanceof ConversationError) { res.status(error.status).json({ error: error.message }); return; }
+    if (error instanceof z.ZodError) { res.status(400).json({ error: error.issues.map(issue => issue.message).join('; ') }); return; }
     console.error(error.message);
     res.status(error.status ?? 500).json({ error: error.status === 400 ? 'Invalid JSON request body.' : 'The server could not complete this request. Check the local server log.' });
   });
 
-  return { app, store, close: () => { for (const controller of controllers.values()) controller.abort(); } };
+  await conversations.startPending();
+  return { app, store, conversations, close: () => conversations.close() };
 }

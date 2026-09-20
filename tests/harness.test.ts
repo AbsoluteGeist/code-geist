@@ -44,13 +44,14 @@ test('demo runs real failing tests, edits code, and finishes with passing eviden
   } finally { await rm(temp, { recursive: true, force: true }); }
 });
 
-test('a hard step limit leaves a task failed and never claims completion', async () => {
+test('a hard step limit leaves a resumable budget-exhausted task and never claims completion', async () => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'geist-budget-'));
   const run = fixture('budget');
   run.maxSteps = 2;
   try {
     await executeRun(run, { dataDir: temp, signal: new AbortController().signal, onUpdate() {} });
-    assert.equal(run.status, 'failed');
+    assert.equal(run.status, 'budget_exhausted', run.error ?? 'Expected budget exhaustion');
+    assert.equal(run.resumable, true);
     assert.match(run.error!, /Step budget exhausted/);
     assert.equal(run.step, 2);
     assert.equal(run.summary, undefined);
@@ -218,7 +219,7 @@ test('malformed arguments and unknown tool calls have terminal error traces link
       { id: 'missing-tool', type: 'function', function: { name: 'not_registered', arguments: '{}' } },
     ] } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }), { status: 200, headers: { 'content-type': 'application/json' } });
     await executeRun(run, { dataDir: temp, signal: new AbortController().signal, onUpdate() {} });
-    assert.equal(run.status, 'failed');
+    assert.equal(run.status, 'budget_exhausted', run.error ?? 'Expected budget exhaustion');
     const setup = run.events.find(event => event.trace?.kind === 'setup')!;
     assert.equal(setup.status, 'success');
     const setupDetail = await readTraceDetail(temp, run, setup.id);

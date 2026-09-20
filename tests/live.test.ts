@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { test } from 'node:test';
 import { executeRun } from '../server/harness.js';
-import type { Run } from '../shared/types.js';
+import type { Run, RuntimeUpdate } from '../shared/types.js';
 import { readTraceDetail } from '../server/trace.js';
 
 const exec = promisify(execFile);
@@ -103,13 +103,23 @@ test('live harness routes through Jev and completes real inspect/fail/edit/verif
       if (step === 5 || step === 7) assert.equal(JSON.parse(lastObservation).passed, true);
       if (step === 6) assert.match(lastObservation, /files changed after the last verification/);
 
-      sendJSON(response, {
-        choices: [{ finish_reason: 'tool_calls', message: {
-          role: 'assistant', content: null, reasoning_content: `local-reasoning-state-${step}`,
-          tool_calls: actions[step].map((action, index) => ({ id: `step_${step}_call_${index}`, type: 'function', function: { name: action.name, arguments: JSON.stringify(action.args) } })),
-        } }],
-        usage: { prompt_tokens: 100, completion_tokens: 20 },
-      });
+      assert.equal(payload.stream, true);
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      const frame = (delta: unknown, finishReason: string | null = null) => `data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: finishReason }] })}\r\n\r\n`;
+      response.write(frame({ role: 'assistant', content: '' }));
+      response.write(frame({ reasoning_content: `local-reasoning-state-${step}` }));
+      response.write(frame({ content: `Coding step ${step + 1}: ${'Inspecting the real source and verification results. '.repeat(5)}Credential echo: local-specialist-` }));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      response.write(frame({ content: 'secret. FINAL_PUBLIC_STEP' }));
+      for (const [index, action] of actions[step].entries()) {
+        const args = JSON.stringify(action.args);
+        const midpoint = Math.floor(args.length / 2);
+        response.write(frame({ tool_calls: [{ index, id: `step_${step}_call_${index}`, type: 'function', function: { name: action.name, arguments: args.slice(0, midpoint) } }] }));
+        response.write(frame({ tool_calls: [{ index, function: { arguments: args.slice(midpoint) } }] }));
+      }
+      response.write(frame({}, 'tool_calls'));
+      response.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 100, completion_tokens: 20, prompt_cache_hit_tokens: 40, completion_tokens_details: { reasoning_tokens: 10 } } })}\r\n\r\n`);
+      response.end('data: [DONE]\r\n\r\n');
     } catch (error) {
       mockError = error;
       sendJSON(response, { error: 'Mock protocol assertion failed' }, 500);
@@ -164,9 +174,15 @@ test('live harness routes through Jev and completes real inspect/fail/edit/verif
       events: [], files: [], diff: '', metrics: { modelCalls: 0, jevCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 },
     };
     let updates = 0;
+    const runtimeUpdates: RuntimeUpdate[] = [];
+    let sawLivePublicText = false;
     await executeRun(run, {
       dataDir, signal: new AbortController().signal,
       onUpdate: async () => { updates++; await writeFile(savedRunPath, JSON.stringify(run)); },
+      onEvent: (event) => {
+        runtimeUpdates.push(event);
+        if (event.type === 'message.delta' && event.delta && !event.delta.endsWith('FINAL_PUBLIC_STEP') && run.events.find((entry) => entry.id === event.callId)?.status === 'running') sawLivePublicText = true;
+      },
     });
     if (mockError) throw mockError;
 
@@ -177,6 +193,12 @@ test('live harness routes through Jev and completes real inspect/fail/edit/verif
     assert.equal(run.baseCommit, baseCommit);
     assert.equal(run.step, 8);
     assert.equal(generationCalls, 8);
+    assert(sawLivePublicText, 'Public assistant text must arrive before the provider request completes.');
+    assert(runtimeUpdates.some((event) => event.type === 'usage.updated' && event.usage?.reported && event.usage.inputTokens === 100));
+    assert(!JSON.stringify(runtimeUpdates).includes('local-specialist-secret'));
+    assert(!JSON.stringify(runtimeUpdates).includes('local-reasoning-state'));
+    assert.equal(run.chatMessages?.length, generationCalls);
+    assert(run.chatMessages?.every((message) => message.finished && message.content.endsWith('FINAL_PUBLIC_STEP') && message.content.includes('[REDACTED]')));
     assert.equal(jevCalls, 3);
     assert.deepEqual([...observedJevKinds].sort(), ['context', 'failure', 'route']);
     assert.equal(run.metrics.modelCalls, generationCalls);
@@ -237,7 +259,7 @@ test('live harness routes through Jev and completes real inspect/fail/edit/verif
     assert.equal(firstModel.event.trace?.usage?.inputTokens, 100);
     const secondModel = await readTraceDetail(dataDir, persisted, models[1].id);
     const secondRequest = secondModel.request as { body: { messages: Array<Record<string, any>> } };
-    assert.equal(secondRequest.body.messages[2].reasoning_content, 'local-reasoning-state-0');
+    assert.equal(secondRequest.body.messages.find((message) => message.role === 'assistant')?.reasoning_content, 'local-reasoning-state-0');
     assert(secondRequest.body.messages.some((message) => message.role === 'tool' && message.tool_call_id === 'step_0_call_1' && JSON.parse(message.content).content === originalCode));
 
     for (const event of toolEvents) {

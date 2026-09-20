@@ -27,10 +27,13 @@ const server = app.listen(port, host, () => {
     console.log(`Code Geist API → http://${urlHost}:${port}`);
   }
 });
+let shuttingDown = false;
 for (const event of ['SIGTERM', 'SIGINT'] as const) {
   process.once(event, () => {
-    close();
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 2500).unref();
+    if (shuttingDown) return;
+    shuttingDown = true;
+    server.close();
+    setTimeout(() => process.exit(0), 5000).unref();
+    void close().finally(() => { server.closeAllConnections(); process.exit(0); });
   });
 }

@@ -27,7 +27,7 @@ export class CommandCancelledError extends Error {
 
 export async function runCommand(
   executable: string, args: string[],
-  options: { cwd: string; signal?: AbortSignal; timeoutMs?: number; maxOutput?: number },
+  options: { cwd: string; signal?: AbortSignal; timeoutMs?: number; maxOutput?: number; onOutput?: (delta: string) => Promise<void> | void },
 ): Promise<CommandResult> {
   options.signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
@@ -38,11 +38,24 @@ export async function runCommand(
     let output = '';
     let timedOut = false;
     let truncated = false;
+    let pendingOutput = '';
+    let outputDelivery = Promise.resolve();
+    const flushOutput = () => {
+      if (!pendingOutput || !options.onOutput) return;
+      const delta = pendingOutput;
+      pendingOutput = '';
+      outputDelivery = outputDelivery.then(() => options.onOutput!(delta));
+      void outputDelivery.catch(() => {});
+    };
+    const outputTimer = setInterval(flushOutput, 100);
+    outputTimer.unref();
     const maxOutput = options.maxOutput ?? MAX_OUTPUT;
     const append = (data: Buffer) => {
       const text = data.toString('utf8');
       if (output.length + text.length > maxOutput) truncated = true;
-      output += text.slice(0, Math.max(0, maxOutput - output.length));
+      const accepted = text.slice(0, Math.max(0, maxOutput - output.length));
+      output += accepted;
+      pendingOutput += accepted;
     };
     child.stdout.on('data', append);
     child.stderr.on('data', append);
@@ -56,10 +69,11 @@ export async function runCommand(
     const abort = () => kill();
     options.signal?.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(() => { timedOut = true; kill(); }, options.timeoutMs ?? 120_000);
-    const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', abort); };
+    const cleanup = () => { clearTimeout(timer); clearInterval(outputTimer); flushOutput(); options.signal?.removeEventListener('abort', abort); };
     child.once('error', error => { cleanup(); reject(error); });
-    child.once('close', exitCode => {
+    child.once('close', async exitCode => {
       cleanup();
+      try { await outputDelivery; } catch (error) { reject(error); return; }
       const result = { exitCode, timedOut, truncated, output: output + (truncated ? '\n[Output truncated]' : '') + (timedOut ? '\n[Command timed out]' : '') };
       if (options.signal?.aborted) { reject(new CommandCancelledError(result, options.signal.reason)); return; }
       resolve(result);

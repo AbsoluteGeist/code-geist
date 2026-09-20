@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { EventType, Run, RunEvent, TraceDetail, TraceMetadata, TracePayload } from '../shared/types.js';
+import type { EventType, Run, RunEvent, TraceDetail, TraceMetadata, TracePayload, TokenUsage } from '../shared/types.js';
 import { getModelConfiguration, loadModelProfiles } from './model-config.js';
 
 export interface TraceStart {
@@ -21,7 +21,10 @@ export interface TraceFinish {
   error?: string;
   message?: string;
   httpStatus?: number;
-  usage?: { inputTokens: number; outputTokens: number };
+  usage?: TokenUsage;
+  firstTokenAt?: string;
+  ttftMs?: number;
+  generationMs?: number;
   data?: Record<string, unknown>;
 }
 
@@ -199,6 +202,7 @@ export function createTraceRecorder(run: Run, dataDir: string, onUpdate: () => P
         endedAt, durationMs: Math.max(0, Math.round(performance.now() - pending.started)),
         hasResponse: safe.response !== undefined, error: safe.error,
         httpStatus: safe.httpStatus, usage: safe.usage,
+        firstTokenAt: safe.firstTokenAt, ttftMs: safe.ttftMs, generationMs: safe.generationMs,
       });
       active.delete(id);
       run.updatedAt = endedAt;

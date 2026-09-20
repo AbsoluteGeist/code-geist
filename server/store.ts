@@ -31,9 +31,10 @@ export class RunStore {
           event.trace.error = 'Interrupted by a server restart. No complete response was recorded.';
           recovered = true;
         }
-        if (run.status === 'running' || run.status === 'queued') {
-          run.status = 'failed';
-          run.error = 'The server restarted before this run finished. Start a new run to continue.';
+        if (run.status === 'running') {
+          run.status = 'interrupted';
+          run.resumable = Boolean(run.workspace);
+          run.error = 'The server restarted before this turn finished. Continue to recover the retained workspace.';
           run.events.push({ id: randomUUID(), at: new Date().toISOString(), type: 'error', title: 'Run interrupted', message: run.error, status: 'error' });
           recovered = true;
         }
@@ -59,6 +60,7 @@ export class RunStore {
       await writeFile(`${target}.tmp`, JSON.stringify(snapshot), { mode: 0o600 });
       await rename(`${target}.tmp`, target);
       this.events.emit(run.id, snapshot);
+      this.events.emit('saved', snapshot);
     });
     this.writes.set(run.id, pending);
     void pending.finally(() => {

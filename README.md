@@ -41,7 +41,7 @@ TYPESAFE_API_KEY=your-typesafe-key
 TYPESAFE_MODEL=jev-1.13.0
 ```
 
-The generation adapter uses `/chat/completions` with function tools. Choose a model that supports that protocol. It preserves provider-specific assistant fields such as DeepSeek's `reasoning_content` between tool calls. Models requiring the Responses API need a separate adapter.
+The generation adapter uses `/chat/completions` with function tools and streaming by default. Choose a model that supports that protocol. It preserves provider-specific assistant fields such as DeepSeek's `reasoning_content` within a turn. Models requiring the Responses API need a separate adapter. An endpoint returning ordinary JSON is still supported; use `streaming: false` in a model profile (or `OPENAI_STREAMING=false` for a single provider) to explicitly disable SSE. Set `streamUsage: true` / `OPENAI_STREAM_USAGE=true` only if the endpoint supports `stream_options.include_usage`. Requests are never silently retried in another mode.
 
 For DeepSeek, Zhipu, and other providers together:
 
@@ -90,9 +90,23 @@ References: [DeepSeek API](https://api-docs.deepseek.com/), [Zhipu documentation
 5. Start the task. Inspect the activity timeline, Jev decisions, changed files, and verification output. Stop is available while running.
 6. Review the retained worktree and download the patch. Apply it yourself to the appropriate source revision after review, for example with `git apply --check /path/to/downloaded.patch` followed by `git apply /path/to/downloaded.patch`.
 
-Live tasks run in a new Git worktree on a `feat/agent-…` branch, starting from the source repository's committed `HEAD`. Uncommitted changes and untracked files from the source checkout are not copied. The agent's tools edit the worktree; the source checkout stays untouched. Dependency directories are not copied, so use a setup command when the verification needs them.
+The first turn of a live conversation creates a Git worktree on a `feat/agent-…` branch, starting from the source repository's committed `HEAD`. Later turns reuse that worktree, including its uncommitted changes. Uncommitted changes and untracked files from the source checkout are not copied. The agent's tools edit the worktree; the source checkout stays untouched. Dependency directories are not copied, so use a setup command when verification needs them.
 
 A run can finish successfully only after it has a nonempty diff and passing verification for the current revision. Passing tests are evidence for the configured checks, not a guarantee that every aspect of the requested behavior is correct; review the diff and the task's acceptance criteria. Budget exhaustion, failed requests, and cancellation remain visible as incomplete runs.
+
+## Continue a conversation
+
+**Chat** is the default view. Send another message to make the next change in the same workspace, or choose **Ask** for a read-only discussion. Ask turns can inspect files and answer without changing code or running commands. **Code** turns retain the current-revision verification gate. The scripted demo supports a documentation-only follow-up and a canned explanation; it does not pretend to implement arbitrary prompts.
+
+Messages submitted while a turn is running are queued and executed in order after successful completion. A failed, stopped, or budget-exhausted turn pauses its existing queue until you continue it or send a new instruction. Submission IDs prevent HTTP retries from duplicating messages. Different conversations use independent workspaces; each conversation executes one turn at a time.
+
+**Continue +12** adds twelve model rounds to the same interrupted turn, retaining its model history, workspace, tool records and cumulative usage. Every model request receives its remaining budget and current verification state; the last six rounds include explicit closing guidance. A later executed turn prevents resuming an earlier turn over newer changes. Cancelled queued messages never become workspace owners.
+
+Private checkpoints in `.codegeist/checkpoints/` preserve exact provider continuation messages at model-response and tool-result boundaries with file permissions `0600`. Confirmed results are reused. Tools whose execution was interrupted are reconciled as unknown; commands are not blindly replayed. Setup runs once on the first Code turn that needs it, and interrupted setup is not automatically repeated. Manual workspace changes invalidate stale verification. Older runs without checkpoints support explicitly labeled fresh-context recovery in their retained workspace.
+
+Public conversation events are journaled under `.codegeist/conversations/` with monotonic sequence IDs. The UI reconnects using snapshots and ordered replay without duplicating assistant text or usage. Model text and command output arrive incrementally; full request/response details remain available in Activity. Switch the inspection turn to review that turn's trace, saved diff and verification.
+
+The footer can show this turn or the entire conversation: user turns, model steps, LLM/tool durations, first-token latency, generation throughput, cached-input share, and confirmed input/output tokens. Jev has a separate breakdown. Usage is accounted once per request; cached-input and reasoning tokens are subsets, not additional totals. Unknown provider metrics display `—`; tokens are not estimated. While a request runs, the footer labels the confirmed totals. Chat messages preserve the full conversation within the provider's context limit; automatic history summarization is not implemented.
 
 ## Inspect activity traces
 
@@ -110,13 +124,14 @@ This MVP runs **trusted local repositories and commands**, under your OS account
 
 Model tools are restricted to listing, reading, searching, writing, running the preconfigured verification command, and finishing. File tools reject path traversal, symlinks, and `.git` / `.env` access. Commands use `shell: false`, have time limits, and receive a restricted environment without provider API keys. Compound shell expressions such as `npm ci && npm test` are unsupported: use separate setup and verification fields, or a repository script. API calls can send the task, selected source snippets, tool outputs, and generated code to your configured providers.
 
-Runs and workspaces are retained in `.codegeist/` (ignored by Git). History and completed results survive restarts; interrupted runs are marked failed instead of silently resuming. Remove retained live worktrees with `git worktree remove /absolute/worktree/path` when no longer needed, after saving any desired changes. Automatic merging, deployment, arbitrary agent-chosen shell commands, and unbounded background execution are outside this MVP.
+Runs and workspaces are retained in `.codegeist/` (ignored by Git). History and completed results survive restarts; active turns become interrupted and can be continued. Untouched queued messages remain queued; they start when their preceding turn has completed. Remove retained live worktrees with `git worktree remove /absolute/worktree/path` when no longer needed, after saving any desired changes. Automatic merging, deployment, arbitrary agent-chosen shell commands, and unbounded execution are outside this MVP.
 
 ## Configuration
 
 | Variable | Purpose |
 | --- | --- |
 | `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_API_KEY` | Single generation provider |
+| `OPENAI_STREAMING`, `OPENAI_STREAM_USAGE` | Single-provider SSE switch (default true) and optional usage request flag (default false) |
 | `CODEGEIST_MODELS_FILE` | Optional model profile JSON path; defaults to `models.config.json` |
 | `TYPESAFE_API_KEY` | Enables Jev judgments |
 | `TYPESAFE_BASE_URL` | Defaults to `https://api.typesafe.ai/v1` |
@@ -141,6 +156,8 @@ src/                 React workbench, theme, activity/diff/test views
 shared/types.ts      API and event contracts
 server/app.ts        Local HTTP API and server-sent events
 server/store.ts      Persistent run records and restart recovery
+server/conversations.ts  Per-conversation queues, durable public events, replay and continuation
+server/checkpoint.ts Private resumable execution context and workspace identity checks
 server/harness.ts    Bounded agent loop and completion checks
 server/tools.ts      Validated filesystem and verification tools
 server/workspace.ts  Git worktrees, processes, and patches

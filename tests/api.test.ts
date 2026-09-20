@@ -15,7 +15,7 @@ test('API rejects cross-site requests, validates inputs, and persists completed 
   await new Promise<void>(resolve => server.once('listening', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   t.after(async () => {
-    instance.close();
+    await instance.close();
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
     await rm(dataDir, { recursive: true, force: true });
@@ -95,7 +95,7 @@ test('cancellation interrupts a run, and concurrent execution is rejected', asyn
   await new Promise<void>(resolve => server.once('listening', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   t.after(async () => {
-    instance.close();
+    await instance.close();
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
     await rm(dataDir, { recursive: true, force: true });
@@ -121,6 +121,6 @@ test('unfinished persisted runs are marked interrupted on restart', async t => {
   await store.save(run);
   const reopened = new RunStore(dataDir);
   await reopened.initialize();
-  assert.equal(reopened.runs.get(run.id)?.status, 'failed');
+  assert.equal(reopened.runs.get(run.id)?.status, 'interrupted');
   assert.match(reopened.runs.get(run.id)?.error ?? '', /restarted/);
 });
