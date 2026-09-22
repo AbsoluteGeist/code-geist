@@ -8,6 +8,8 @@ Give it a task and a Git repository, then inspect model decisions, code changes,
 
 The harness owns execution. An OpenAI-compatible generative model writes code and calls tools. Jev selects a configured model, ranks context, and classifies failed verification. Every decision has an explicit source: Jev, a deterministic fallback, a user override, or the scripted demo.
 
+![Code Geist split view showing a coding conversation, Jev evaluations, and activity traces](docs/img/demo.png)
+
 ## Quick start
 
 Requires Node.js 22.12+ and Git. Run these commands from the repository root:

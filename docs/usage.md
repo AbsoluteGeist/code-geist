@@ -25,6 +25,8 @@ A Code run can finish successfully only after it has a nonempty diff and passing
 
 Use the **Tabs / Split** control in the conversation header to choose a layout. Split keeps Chat and its composer on the left while Activity, Changes, and Verification share the right column. The columns scroll independently, and switching inspection tabs preserves the chat draft. Layout preference is remembered; narrow screens use tabs automatically.
 
+![Code Geist split view showing a coding conversation, Jev evaluations, and activity traces](img/demo.png)
+
 ### Queued messages
 
 Messages submitted while a turn is running are queued and executed in order after successful completion. A failed, stopped, or budget-exhausted turn pauses its existing queue until you continue it or send a new instruction. Submission IDs prevent HTTP retries from duplicating messages. Different conversations use independent workspaces; each conversation executes one turn at a time.
