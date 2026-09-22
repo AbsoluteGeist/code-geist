@@ -1,6 +1,8 @@
 {
   "name": "code-geist",
   "version": "0.1.0",
+  "description": "An experimental local coding-agent workbench using Jev for model routing, with tool execution and verification in Git worktrees.",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {
